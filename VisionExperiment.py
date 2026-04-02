@@ -88,10 +88,14 @@ class NostalgiaExperiment:
 
         self.log_global = "/kaggle/working/"
         # self.writer = SummaryWriter(logdir=os.path.join(self.log_global, self.config.log_dir))
-        self.writer = WandbLogger(
-            project='Nostalgia',
-            config=asdict(self.config)
-        )
+
+        if xm.is_master_ordinal():
+            self.writer = WandbLogger(
+                project='Nostalgia',
+                config=asdict(self.config)
+            )
+        else:
+            self.writer = None
         self.finished_domains = []
 
         # xm.master_print(f"Initialized on device: {self.device}, world_size={self.config.world_size}")
@@ -249,9 +253,27 @@ class NostalgiaExperiment:
                 total_loss += loss.item() * labels.size(0)
                 total_acc  += acc.item()  * labels.size(0)
                 count += labels.size(0)
+            global_loss_sum = xm.mesh_reduce(
+                f"{dom}_loss_sum",
+                total_loss,
+                sum
+            )
+
+            global_acc_sum = xm.mesh_reduce(
+                f"{dom}_acc_sum",
+                total_acc,
+                sum
+            )
+
+            global_count = xm.mesh_reduce(
+                f"{dom}_count",
+                count,
+                sum
+            )
+
             results[dom] = {
-                'Test_Loss': total_loss / count,
-                'Test_Accuracy':  (total_acc  / count) * 100
+                'Test_Loss': global_loss_sum / global_count,
+                'Test_Accuracy': (global_acc_sum / global_count) * 100
             }
         self.model.train()
         avg_acc = sum(r['Test_Accuracy'] for r in results.values()) / len(results)
@@ -353,21 +375,22 @@ class NostalgiaExperiment:
 
                     if step % 100 == 0 and xm.is_master_ordinal():
                         print(f"Domain {domain} | Ep {epoch} | Step {global_step} | Loss {loss.item():.4f} | Acc {accuracy.item()*100:.4f}%")
-                        self.writer.add_scalars(domain, {
-                            f'Training_Loss'    : loss.item(),
-                            f'Training_Accuracy': accuracy.item(),
-                            f'LR'               : scheduler.get_last_lr()[0]
-                        }, global_step)
+                        if self.writer is not None:
+                            self.writer.add_scalars(domain, {
+                                f'Training_Loss'    : loss.item(),
+                                f'Training_Accuracy': accuracy.item(),
+                                f'LR'               : scheduler.get_last_lr()[0]
+                            }, global_step)
 
                     if step % 200 == 0:
                         # Run evaluation on all test datasets (past, current, and future)
-                        if xm.is_master_ordinal():
-                            result, acc, loss = self.evaluate_all_seen(criterion, rank)
-                            print(f"Validation Score | Loss: {result[domain]['Test_Loss']:.4f} | Accuracy: {result[domain]['Test_Accuracy']:.4f}%")
-                            print()
-                            for domain, metrics in result.items():
+                        # if xm.is_master_ordinal():
+                        result, acc, loss = self.evaluate_all_seen(criterion, rank)
+                        print(f"Validation Score | Loss: {result[domain]['Test_Loss']:.4f} | Accuracy: {result[domain]['Test_Accuracy']:.4f}%")
+                        for domain, metrics in result.items():
+                            if self.writer is not None:
                                 self.writer.add_scalars(domain, metrics, global_step)
-                            self.model.set_active_task(domain)   # Evaluation possible changes the head, so setting it back to the current task
+                        self.model.set_active_task(domain)   # Evaluation possible changes the head, so setting it back to the current task
 
             # if xm.is_master_ordinal() or True:
 
