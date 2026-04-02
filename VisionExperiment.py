@@ -110,7 +110,6 @@ class NostalgiaExperiment:
 
         xm.master_print(f"[Rank {rank}] world_size = {xr.world_size()}")
         xm.master_print(f"[Rank {rank}] device = {self.device}")
-
         xm.master_print(f"\n\n=========== Computing Q Lambda for {domain} =================")
 
         for epoch in range(self.config.iterations_of_accumulation):
@@ -331,15 +330,10 @@ class NostalgiaExperiment:
 
         global_step = 1
         self.model.set_Q(Q_curr, scaling=None)
+
         optimizer = self.model.configure_optimizers(
             writter = self.writer,
             iteration = global_step,   # REQUIRED FOR LOGGING
-        )
-
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer.base_optimizer,
-            T_max=len(self.current_train_loader) * self.config.num_epochs,
-            eta_min=1e-6
         )
 
         domain_list = []
@@ -359,7 +353,13 @@ class NostalgiaExperiment:
             self.finished_domains.append(domain)
             self.train_taskhead(domain, self.config.head_warmup_epochs, rank)
 
-            print(f"\n========== Full Training: ===========")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer.base_optimizer,
+                T_max=len(self.current_train_loader) * self.config.num_epochs,
+                eta_min=1e-6
+            )
+
+            xm.master_print(f"\n========== Full Training: ===========")
 
             for epoch in range(self.config.num_epochs):
                 self.current_train_sampler.set_epoch(epoch)
@@ -388,10 +388,10 @@ class NostalgiaExperiment:
                         # Run evaluation on all test datasets (past, current, and future)
                         # if xm.is_master_ordinal():
                         result, acc, loss = self.evaluate_all_seen(criterion, rank)
-                        print(f"Validation Score | Loss: {result[domain]['Test_Loss']:.4f} | Accuracy: {result[domain]['Test_Accuracy']:.4f}%")
-                        for domain, metrics in result.items():
+                        xm.master_print(f"Validation Score | Loss: {result[domain]['Test_Loss']:.4f} | Accuracy: {result[domain]['Test_Accuracy']:.4f}%")
+                        for eval_domain, metrics in result.items():
                             if self.writer is not None:
-                                self.writer.add_scalars(domain, metrics, global_step)
+                                self.writer.add_scalars(eval_domain, metrics, global_step)
                         self.model.set_active_task(domain)   # Evaluation possible changes the head, so setting it back to the current task
 
             # if xm.is_master_ordinal() or True:
