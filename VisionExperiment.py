@@ -195,7 +195,7 @@ class NostalgiaExperiment:
                 train_ds,
                 batch_size=per_core_bs,
                 sampler=train_sampler,
-                num_workers=self.config.num_workers,
+                num_workers=0,
                 pin_memory=False,
                 drop_last=True
             ), self.device
@@ -206,7 +206,7 @@ class NostalgiaExperiment:
                 test_ds,
                 batch_size=per_core_bs,
                 sampler=test_sampler,
-                num_workers=self.config.num_workers,
+                num_workers=0,
                 pin_memory=False,
                 drop_last=False
             ), self.device
