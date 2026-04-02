@@ -121,14 +121,14 @@ class ContinualLearnerViT(nn.Module):
             )["pixel_values"].to(x.device)
 
         return x
-        
+
 
     def _apply_peft(self):
         if self.use_peft:
             self.backbone = get_peft_model(self.backbone, self.lora_config) #type: ignore
             self.is_peft_on = True
 
-    
+
     def _merge_and_unload_peft(self):
         if self.is_peft_on:
             self.backbone = self.backbone.merge_and_unload() #type: ignore

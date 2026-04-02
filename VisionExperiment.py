@@ -4,10 +4,10 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torchvision.transforms as transforms
-import torch_xla
 
 from dataclasses import dataclass, asdict
 from tqdm.notebook import tqdm
@@ -47,17 +47,6 @@ class NostalgiaExperiment:
             lora_r=self.config.lora_r, lora_alpha=self.config.lora_alpha, lora_dropout=0.1,
             use_peft=True, lora_modules = None, device=self.device, optimizer_type="adamw"
         ).to(self.device)
-
-        def vit_transform(image):
-            image = self.augment(image)
-            pixel_values = self.model.backbone.processor(
-                images=image,
-                return_tensors="pt"
-            )["pixel_values"].squeeze(0)
-
-            return pixel_values
-
-        self.transform = vit_transform
 
         # Create datasets once — shared across epochs/domains
         self.domains = ['clipart', 'quickdraw', 'sketch', 'infograph', 'painting']
@@ -101,6 +90,14 @@ class NostalgiaExperiment:
         xm.master_print(f"Initialized on device: {self.device}, world_size={self.config.world_size}")
 
 
+    def transform(self, image):
+        image = self.augment(image)
+        pixel_values = self.model.backbone.processor(
+            images=image,
+            return_tensors="pt"
+        )["pixel_values"].squeeze(0)
+
+        return pixel_values
 
     def update_Q_Lambda_for_single_domain(
         self, domain, rank
