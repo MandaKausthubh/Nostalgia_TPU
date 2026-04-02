@@ -33,13 +33,14 @@ class NostalgiaExperiment:
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
             # transforms.ToTensor(),
         ])
+        self.config.world_size = xm.world_size()
 
         if self.config.use_tpu:
             self.device = xm.xla_device()
         else:
             self.device = torch.device(self.config.device)
 
-        print(self.device)
+        xm.master_print(self.device)
 
         self.model = ContinualLearnerViT(
             lr=self.config.lr, downstream_lr=self.config.downstream_lr, 
@@ -53,7 +54,7 @@ class NostalgiaExperiment:
                 images=image,
                 return_tensors="pt"
             )["pixel_values"].squeeze(0)
-        
+
             return pixel_values
 
         self.transform = vit_transform
@@ -69,7 +70,7 @@ class NostalgiaExperiment:
 
         root = self.config.root_dir
         for domain in self.domains:
-            print(f"Preparing the dataset for: {domain}")
+            xm.master_print(f"Preparing the dataset for: {domain}")
             self.train_datasets[domain] = DomainNet(
                 root, domain, train=True, transform=self.transform
             )
@@ -97,8 +98,9 @@ class NostalgiaExperiment:
         else:
             self.writer = None
         self.finished_domains = []
+        xm.master_print(f"Initialized on device: {self.device}, world_size={self.config.world_size}")
 
-        # xm.master_print(f"Initialized on device: {self.device}, world_size={self.config.world_size}")
+
 
     def update_Q_Lambda_for_single_domain(
         self, domain, rank
@@ -106,14 +108,14 @@ class NostalgiaExperiment:
         self.prepare_dataloaders_for_domain(domain, rank)
         Q, Lambda = None, None
 
-        print(f"[Rank {rank}] world_size = {xr.world_size()}")
-        print(f"[Rank {rank}] device = {self.device}")
+        xm.master_print(f"[Rank {rank}] world_size = {xr.world_size()}")
+        xm.master_print(f"[Rank {rank}] device = {self.device}")
 
-        print(f"\n\n=========== Computing Q Lambda for {domain} =================")
+        xm.master_print(f"\n\n=========== Computing Q Lambda for {domain} =================")
 
         for epoch in range(self.config.iterations_of_accumulation):
 
-            print(f"[Rank {rank}] Epoch Starting: {epoch}")
+            xm.master_print(f"[Rank {rank}] Epoch Starting: {epoch}")
             self.current_train_sampler.set_epoch(epoch)
             t1 = time.time()
             Q_new, Lambda_new = compute_Q_for_task(
@@ -134,7 +136,7 @@ class NostalgiaExperiment:
             torch_xla.sync()
             t3 = time.time()
             if rank==0:
-                print(
+                xm.master_print(
                     f"[MASTER]Q Lambda calculation domain: {domain} | epoch: {epoch} | "
                     f"Computing Q/L = {t2-t1:.6f} | Accumulate = {t3-t2:.6f}"
                     f"Q shape: {Q.shape}"
@@ -156,7 +158,7 @@ class NostalgiaExperiment:
             )
         return Q, Lambda
 
-        
+
     def prepare_dataloaders_for_domain(self, domain, rank):
         """Call this when switching to a new domain in continual training"""
         if domain not in self.domains:
@@ -226,7 +228,7 @@ class NostalgiaExperiment:
 
         xm.master_print(f"Prepared loaders for domain '{domain}' (per-core bs={per_core_bs})")
 
-        
+
     def compute_loss_accuracy(
         self, domain_name, inputs, targets, criterion
     ):
@@ -238,7 +240,7 @@ class NostalgiaExperiment:
 
         return loss, accuracy
 
-    
+
     @torch.no_grad()
     def evaluate_all_seen(self, criterion, rank):
         self.model.eval()
@@ -253,18 +255,17 @@ class NostalgiaExperiment:
                 total_loss += loss.item() * labels.size(0)
                 total_acc  += acc.item()  * labels.size(0)
                 count += labels.size(0)
+
             global_loss_sum = xm.mesh_reduce(
                 f"{dom}_loss_sum",
                 total_loss,
                 sum
             )
-
             global_acc_sum = xm.mesh_reduce(
                 f"{dom}_acc_sum",
                 total_acc,
                 sum
             )
-
             global_count = xm.mesh_reduce(
                 f"{dom}_count",
                 count,
@@ -275,6 +276,7 @@ class NostalgiaExperiment:
                 'Test_Loss': global_loss_sum / global_count,
                 'Test_Accuracy': (global_acc_sum / global_count) * 100
             }
+
         self.model.train()
         avg_acc = sum(r['Test_Accuracy'] for r in results.values()) / len(results)
         avg_loss = sum(r['Test_Loss'] for r in results.values()) / len(results)
@@ -302,10 +304,10 @@ class NostalgiaExperiment:
             eta_min=1e-6
         )
 
-        print(f"\n======= Training task head for {domain} ========")
+        xm.master_print(f"\n======= Training task head for {domain} ========")
         for epoch in range(epochs):
             step_iter = 0
-            print(f"\nStarting epoch: {epoch}")
+            xm.master_print(f"\nStarting epoch: {epoch}")
             for inputs, targets in self.current_train_loader:
                 inputs, targets = inputs.to(self.model.device), targets.to(self.model.device)
                 optimizer.zero_grad()
@@ -317,9 +319,9 @@ class NostalgiaExperiment:
                 xm.optimizer_step(optimizer)
                 scheduler.step()
                 if step_iter%10==0:
-                    print(f'\tTask headtraining loss at step {step_iter}: {loss.item():.4f}')
+                    xm.master_print(f'\tTask headtraining loss at step {step_iter}: {loss.item():.4f}')
                 step_iter+=1
-            
+
 
     def train(self, rank):
         Q_curr, Lambda_curr = None, None
@@ -412,6 +414,6 @@ class NostalgiaExperiment:
 
                 # Q_curr = broadcast_tensor(Q_curr)
                 # Lambda_curr = broadcast_tensor(Lambda_curr)
-            print("Number of steps at the end of training: ", {global_step})
+            xm.master_print("Number of steps at the end of training: ", {global_step})
 
         xm.master_print("All domains completed")
