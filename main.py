@@ -1,4 +1,4 @@
-from .VisionExperiment import NostalgiaExperiment
+from VisionExperiment import NostalgiaExperiment
 import torch_xla.distributed.xla_multiprocessing as xmp
 from models.model import NostalgiaConfig
 
