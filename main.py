@@ -3,7 +3,9 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 from models.model import NostalgiaConfig
 
 def _mp_fn(rank):
-    config = NostalgiaConfig()
+    config = NostalgiaConfig(
+        num_workers=0
+    )
     experiment = NostalgiaExperiment(config)
     experiment.train(rank)
 

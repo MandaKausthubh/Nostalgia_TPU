@@ -21,6 +21,9 @@ from utils.TPU import *
 
 from models.model import ContinualLearnerViT, NostalgiaConfig
 
+
+
+
 class NostalgiaExperiment:
     def __init__(self, config: NostalgiaConfig):
         self.config = config
@@ -29,9 +32,7 @@ class NostalgiaExperiment:
         self.augment = transforms.Compose([
             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
-            # transforms.ColorJitter(0.4, 0.4, 0.4, 0.2),
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
-            # transforms.ToTensor(),
         ])
         self.config.world_size = xr.world_size()
 
@@ -40,12 +41,18 @@ class NostalgiaExperiment:
         else:
             self.device = torch.device(self.config.device)
 
-        xm.master_print(self.device)
+        print("Using device: ", self.device)
 
         self.model = ContinualLearnerViT(
-            lr=self.config.lr, downstream_lr=self.config.downstream_lr, 
-            lora_r=self.config.lora_r, lora_alpha=self.config.lora_alpha, lora_dropout=0.1,
-            use_peft=True, lora_modules = None, device=self.device, optimizer_type="adamw"
+            lr=self.config.lr,
+            downstream_lr=self.config.downstream_lr, 
+            lora_r=self.config.lora_r,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=0.1,
+            use_peft=True,
+            lora_modules = None,
+            device=self.device,
+            optimizer_type="adamw"
         ).to(self.device)
 
         # Create datasets once — shared across epochs/domains
@@ -195,7 +202,7 @@ class NostalgiaExperiment:
                 train_ds,
                 batch_size=per_core_bs,
                 sampler=train_sampler,
-                num_workers=0,
+                num_workers=self.config.num_workers,
                 pin_memory=False,
                 drop_last=True
             ), self.device
@@ -206,7 +213,7 @@ class NostalgiaExperiment:
                 test_ds,
                 batch_size=per_core_bs,
                 sampler=test_sampler,
-                num_workers=0,
+                num_workers=self.config.num_workers,
                 pin_memory=False,
                 drop_last=False
             ), self.device
