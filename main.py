@@ -8,5 +8,5 @@ def _mp_fn(rank):
     experiment.train(rank)
 
 if __name__ == '__main__':
-    xmp.spawn(_mp_fn, start_method='fork')
+    xmp.spawn(_mp_fn, start_method='spawn')
     # _mp_fn(0)
