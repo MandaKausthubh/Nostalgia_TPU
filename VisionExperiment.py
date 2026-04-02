@@ -33,7 +33,7 @@ class NostalgiaExperiment:
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
             # transforms.ToTensor(),
         ])
-        self.config.world_size = xm.world_size()
+        self.config.world_size = xr.world_size()
 
         if self.config.use_tpu:
             self.device = xm.xla_device()
