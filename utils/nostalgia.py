@@ -1,7 +1,7 @@
 import torch
 from torch.optim.optimizer import Optimizer
 from typing import List, Optional, Any
-from hessians import *
+from utils.hessians import *
 
 
 class NostalgiaOptimizer(Optimizer):
