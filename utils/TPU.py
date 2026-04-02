@@ -1,4 +1,8 @@
 import torch_xla.runtime as xr
+import torch_xla.core.xla_model as xm
+
+from typing import Optional
+import torch
 
 def broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
     """Broadcast from master to all replicas (simple version)"""
