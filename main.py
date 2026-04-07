@@ -8,7 +8,7 @@ python main.py
 
 # Quick smoke-test on CPU with tiny settings:
 python main.py --no-tpu --num-epochs 1 --head-warmup-epochs 0 \
-               --batch-size 32 --hessian-eigenspace-dim 4 --num-workers 0
+               --batch-size 32 --hessian-eigenspace-dim 4
 
 # Sweep backbone LR and LoRA rank:
 python main.py --lr 1e-4 --lora-r 32 --lora-alpha 64
@@ -16,7 +16,7 @@ python main.py --lr 1e-4 --lora-r 32 --lora-alpha 64
 # Full custom run:
 python main.py \
     --root-dir /kaggle/input/datasets/kausthubhmanda/domainnet-fulldataset \
-    --batch-size 512 --num-workers 4 \
+    --batch-size 512 \
     --lr 3e-5 --downstream-lr 3e-4 \
     --optimizer adamw --weight-decay 1e-2 \
     --num-epochs 10 --head-warmup-epochs 3 --warmup-steps 100 \
@@ -65,8 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument(
         "--num-workers", type=int,
-        default=NostalgiaConfig.num_workers,
-        help="DataLoader worker processes per replica (0 = main process only).",
+        # IMPORTANT: must be 0 when using xmp.spawn (start_method='spawn').
+        # DataLoader worker subprocesses try to share tensors with the parent
+        # via _share_fd_cpu_() which requires CPU tensors. XLA tensors live on
+        # device and cannot be shared this way → RuntimeError: _share_fd_:
+        # only available on CPU.  Keep at 0 unless you know what you're doing.
+        default=0,
+        help=(
+            "DataLoader workers per replica. "
+            "MUST be 0 with xmp.spawn (start_method='spawn') on TPU; "
+            "non-zero causes '_share_fd_: only available on CPU'."
+        ),
     )
 
     # ── Learning rates ────────────────────────────────────────────────────
@@ -240,7 +249,7 @@ def args_to_config(args: argparse.Namespace) -> NostalgiaConfig:
         root_dir                     = args.root_dir,
         batch_size                   = args.batch_size,
         batch_size_for_accumulation  = args.batch_size_for_accumulation,
-        num_workers                  = args.num_workers,
+        num_workers                  = args.num_workers,   # safe default = 0
         # learning rates
         lr                           = args.lr,
         downstream_lr                = args.downstream_lr,
@@ -276,7 +285,6 @@ def args_to_config(args: argparse.Namespace) -> NostalgiaConfig:
         log_deltas                   = not args.no_log_deltas,
     )
 
-    # Optional log-dir override (keep auto-generated name if not supplied)
     if args.log_dir is not None:
         cfg.log_dir = args.log_dir
 
@@ -306,8 +314,8 @@ def main() -> None:
         print(f"  {field:<35} {value}")
     print("===================================\n")
 
-    # Pass config through xmp.spawn via the args tuple.
-    # Every spawned process receives an identical copy — no re-parsing needed.
+    # Pass config through xmp.spawn via functools.partial so every spawned
+    # process receives an identical config without re-parsing CLI args.
     xmp.spawn(
         functools.partial(_mp_fn, config=config),
         start_method="spawn",
