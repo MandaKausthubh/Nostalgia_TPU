@@ -7,6 +7,20 @@ import torch_xla.runtime as xr
 from torch.func import functional_call
 import torch
 
+# Flag to track if we're in TPU distributed mode
+_TPU_DISTRIBUTED = None
+
+def _is_tpu_distributed():
+    """Check if we're running in TPU distributed mode (xmp.spawn)."""
+    global _TPU_DISTRIBUTED
+    if _TPU_DISTRIBUTED is None:
+        try:
+            # In xmp.spawn, xr.world_size() > 1 indicates distributed mode
+            _TPU_DISTRIBUTED = xr.world_size() > 1
+        except Exception:
+            _TPU_DISTRIBUTED = False
+    return _TPU_DISTRIBUTED
+
 def hvp(params, vec, grad_fn):
     _, hv = jvp(
         grad_fn,
@@ -105,11 +119,12 @@ def hvp_flat(vec, params, model, inputs, targets, loss_fn):
 
     hv_vec = torch.nn.utils.parameters_to_vector(hv)
 
-    # ---- Distributed reduction OUTSIDE graph (FIX #3) ----
-    if torch.distributed.is_initialized():
+    # ---- Distributed reduction using TPU-native xm.all_reduce ----
+    if _is_tpu_distributed():
         hv_vec = hv_vec.detach()
-        torch.distributed.all_reduce(hv_vec)
-        hv_vec /= torch.distributed.get_world_size()
+        hv_vec = xm.all_reduce(xm.REDUCE_SUM, hv_vec)
+        world_size = xr.world_size()
+        hv_vec = hv_vec / world_size
 
     return hv_vec
 
@@ -203,4 +218,24 @@ def compute_Q_for_task(model, k, device, train_loader):
     )
     # print(f"Lanczos compute time is: {t2-t1}")
 
-    return Q_basis.to(torch.float32), T.to(torch.float32)
+    # Compute eigenvalues from the tridiagonal matrix T
+    # The Ritz values (eigenvalues of T) approximate Hessian eigenvalues
+    # Offload to CPU for TPU/MPS compatibility with eigh
+    offload_to_cpu = T.device.type in ('xla', 'mps')
+    original_device = T.device
+
+    if offload_to_cpu:
+        T = T.detach().cpu()
+
+    eigvals, eigvecs = torch.linalg.eigh(T)
+
+    if offload_to_cpu:
+        eigvals = eigvals.to(original_device)
+        eigvecs = eigvecs.to(original_device)
+
+    # Reorder Q_basis columns to match descending eigenvalue order
+    idx = torch.argsort(eigvals, descending=True)
+    eigvals = eigvals[idx]
+    Q_basis = Q_basis[:, idx]
+
+    return Q_basis.to(torch.float32), eigvals.to(torch.float32)

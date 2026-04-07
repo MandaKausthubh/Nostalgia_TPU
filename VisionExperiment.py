@@ -135,8 +135,9 @@ class NostalgiaExperiment:
                     t=(epoch+1), k=self.config.hessian_eigenspace_dim,
                 )
 
-            broadcast_Q_Lambda(Q, Lambda)
-            torch_xla.sync()
+            # All ranks must call broadcast - rank 0 has the data, others receive it
+            Q, Lambda = broadcast_Q_Lambda(Q, Lambda)
+            xm.mark_step()
             t3 = time.time()
             if rank==0:
                 xm.master_print(

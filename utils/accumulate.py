@@ -2,6 +2,12 @@ import torch
 from typing import Optional, Tuple
 
 
+def _needs_cpu_offload(tensor: torch.Tensor) -> bool:
+    """Check if tensor needs to be moved to CPU for numerical operations."""
+    # TPU ('xla') and MPS may have issues with certain linalg operations
+    return tensor.device.type in ('xla', 'mps')
+
+
 def accumulate_hessian_eigenspace(
     Q_old: Optional[torch.Tensor],
     Lambda_old: Optional[torch.Tensor],
@@ -34,20 +40,24 @@ def accumulate_hessian_eigenspace(
     if Q_old is None or Lambda_old is None:
         return Q_new[:, :k], Lambda_new[:k]
 
-    # Ensure eigenvalues are diagonal matrices
-    if Lambda_old.ndim == 1:
-        Lambda_old = torch.diag(Lambda_old)
-    if Lambda_new.ndim == 1:
-        Lambda_new = torch.diag(Lambda_new)
+    # Ensure Lambda are 1D eigenvalue vectors (not tridiagonal or diagonal matrices)
+    if Lambda_old.ndim == 2:
+        Lambda_old = Lambda_old.diag() if Lambda_old.shape[0] == Lambda_old.shape[1] else Lambda_old.squeeze()
+    if Lambda_new.ndim == 2:
+        Lambda_new = Lambda_new.diag() if Lambda_new.shape[0] == Lambda_new.shape[1] else Lambda_new.squeeze()
+
+    # Convert to diagonal matrices for matrix operations
+    Lambda_old_diag = torch.diag(Lambda_old)
+    Lambda_new_diag = torch.diag(Lambda_new)
 
     # --------------------------------------------------
     # Weighting coefficients for running average
     # --------------------------------------------------
-    alpha = alpha_scaling *(t - 1) / t
+    alpha = alpha_scaling * (t - 1) / t
     beta = beta_scaling / t
 
-    Lambda_old = alpha * Lambda_old
-    Lambda_new = beta * Lambda_new
+    Lambda_old_diag = alpha * Lambda_old_diag
+    Lambda_new_diag = beta * Lambda_new_diag
 
     # --------------------------------------------------
     # Merge subspaces
@@ -57,17 +67,17 @@ def accumulate_hessian_eigenspace(
 
     # Orthonormal basis of merged subspace
     # B ∈ R^{N × r}, r ≤ k_old + k_new
-    if M.device.type == 'mps':
-        # MPS backend has issues with "complete" mode
-        print("[Accumulate] Moving M to CPU for QR decomposition... MPS compatibility issue")
-        M = M.detach().cpu()
+    original_device = Q_new.device
+    offload_to_cpu = _needs_cpu_offload(M)
 
-    print(M.device.type)
+    if offload_to_cpu:
+        print(f"[Accumulate] Moving M to CPU for QR decomposition... {M.device.type} compatibility")
+        M = M.detach().cpu()
 
     B, _ = torch.linalg.qr(M, mode="reduced")
 
-    B = B.to(Q_new.device)
-    M = M.to(Q_new.device)
+    if offload_to_cpu:
+        B = B.to(original_device)
 
     # --------------------------------------------------
     # Project both Hessians into merged basis
@@ -76,18 +86,20 @@ def accumulate_hessian_eigenspace(
     A_new = Q_new.T @ B          # (k_new × r)
 
     # Small matrix S ∈ R^{r × r}
-    S = A_old.T @ Lambda_old @ A_old + A_new.T @ Lambda_new @ A_new
+    S = A_old.T @ Lambda_old_diag @ A_old + A_new.T @ Lambda_new_diag @ A_new
 
     # --------------------------------------------------
     # Eigendecomposition in small space
     # --------------------------------------------------
-    if S.device.type == 'mps':
-        print("[Accumulate] Moving S to CPU for eigendecomposition... MPS compatibility issue")
+    if offload_to_cpu:
+        print(f"[Accumulate] Moving S to CPU for eigendecomposition... {original_device.type} compatibility")
         S = S.detach().cpu()
+
     eigvals, eigvecs = torch.linalg.eigh(S)
 
-    eigvals = eigvals.to(Q_new.device)
-    eigvecs = eigvecs.to(Q_new.device)
+    if offload_to_cpu:
+        eigvals = eigvals.to(original_device)
+        eigvecs = eigvecs.to(original_device)
 
     # Take top-k components
     idx = torch.argsort(eigvals, descending=True)[:k]
