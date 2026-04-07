@@ -53,11 +53,16 @@ class NostalgiaOptimizer(Optimizer):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def set_Q(self, Q: torch.Tensor, scaling: Optional[torch.Tensor] = None):
+    def set_Q(self, Q: Optional[torch.Tensor], scaling: Optional[torch.Tensor] = None):
         """
-        Q: [num_params, k] matrix of eigenvectors
+        Q: [num_params, k] matrix of eigenvectors, or None to disable projection.
         scaling: optional [k] or [k, k] eigenvalue-based scaling
         """
+        if Q is None:
+            self.nostalgia_Q = None
+            self.scaling = None
+            return
+
         if Q.shape[0] != self.num_params:
             raise ValueError(
                 f"Q has {Q.shape[0]} rows, expected {self.num_params} "

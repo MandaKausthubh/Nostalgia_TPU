@@ -1,10 +1,9 @@
-from torch.func import grad, jvp, functional_call
+from torch.func import jvp, functional_call
 from torch.nn.utils import parameters_to_vector
 import torch_xla.core.xla_model as xm
 import torch_xla
 import torch_xla.runtime as xr
 
-from torch.func import functional_call
 import torch
 
 # Flag to track if we're in TPU distributed mode
@@ -15,113 +14,87 @@ def _is_tpu_distributed():
     global _TPU_DISTRIBUTED
     if _TPU_DISTRIBUTED is None:
         try:
-            # In xmp.spawn, xr.world_size() > 1 indicates distributed mode
             _TPU_DISTRIBUTED = xr.world_size() > 1
         except Exception:
             _TPU_DISTRIBUTED = False
     return _TPU_DISTRIBUTED
 
-def hvp(params, vec, grad_fn):
-    _, hv = jvp(
-        grad_fn,
-        (params,),
-        (vec,),
-    )
-    return hv
 
 def flatten_params(params):
     return parameters_to_vector(params.values())
 
-def unflatten(vec, params_template):
 
+def unflatten(vec, params_template):
     new_params = {}
     pointer = 0
-
     for name, p in params_template.items():
         num = p.numel()
         new_params[name] = vec[pointer:pointer+num].view_as(p)
         pointer += num
-
     return new_params
-
-
-# def hvp_flat(vec, params, model, inputs, targets, loss_fn):
-
-#     # Forward
-#     outputs = model(inputs)
-#     loss = loss_fn(outputs, targets)
-
-#     # First gradient
-#     # grads = torch.autograd.grad(
-#     #     loss,
-#     #     params.values(),
-#     #     create_graph=True
-#     # )
-#     grads = torch.autograd.grad(
-#         loss,
-#         params.values(),
-#         create_graph=True
-#     )
-#     grads = [xm.all_reduce(xm.REDUCE_SUM, g) for g in grads]
-#     world_size = xr.world_size()
-#     grads = [g / world_size for g in grads]
-
-#     grad_vec = parameters_to_vector(grads)
-
-#     # Dot product
-#     grad_dot_vec = torch.dot(grad_vec, vec)
-
-#     # Second gradient
-#     hv = torch.autograd.grad(
-#         grad_dot_vec,
-#         params.values(),
-#         retain_graph=False
-#     )
-    
-#     hv = [xm.all_reduce(xm.REDUCE_SUM, h) for h in hv]
-#     hv = [h / world_size for h in hv]
-
-#     hv_vec = parameters_to_vector(hv).detach()
-
-#     return hv_vec
 
 
 def hvp_flat(vec, params, model, inputs, targets, loss_fn):
     """
-    Computes Hessian-vector product Hv using functional parameters
-    and avoids distributed ops inside autograd graph.
-    """
+    Computes Hessian-vector product Hv.
 
-    # ---- Forward with explicit params (FIX #2) ----
-    inputs = model.preprocess_inputs(inputs)
-    representations = functional_call(model.backbone, params, (inputs,))
+    Key fix: we re-detach and re-enable grad on 'vec' so that each
+    Lanczos call starts with a clean graph.  We also avoid retain_graph
+    between the two autograd.grad calls, which was causing graph
+    corruption on XLA after ~3 iterations.
+    """
+    # Ensure vec is properly detached from any previous graph
+    vec = vec.detach().requires_grad_(False)
+
+    # ---- Collect fresh params with grad enabled ----
+    fresh_params = {
+        name: p.detach().requires_grad_(True)
+        for name, p in params.items()
+    }
+
+    # ---- Forward pass ----
+    inputs_proc = model.preprocess_inputs(inputs)
+    representations = functional_call(model.backbone, fresh_params, (inputs_proc,))
     outputs = model.task_head_list[model.active_task](representations)
     loss = loss_fn(outputs, targets)
 
     # ---- First gradient ----
     grads = torch.autograd.grad(
         loss,
-        tuple(params.values()),
-        create_graph=True
+        tuple(fresh_params.values()),
+        create_graph=True,
+        allow_unused=True
+    )
+
+    # Replace None grads with zeros
+    grads = tuple(
+        g if g is not None else torch.zeros_like(p)
+        for g, p in zip(grads, fresh_params.values())
     )
 
     grad_vec = torch.nn.utils.parameters_to_vector(grads)
 
-    # ---- Dot product with vector ----
-    grad_dot_vec = torch.dot(grad_vec, vec)
+    # ---- Dot product with the Lanczos query vector ----
+    # vec lives on XLA; grad_vec also on XLA — fine.
+    grad_dot_vec = (grad_vec * vec.detach()).sum()
 
     # ---- Second gradient (HVP) ----
     hv = torch.autograd.grad(
         grad_dot_vec,
-        tuple(params.values()),
-        retain_graph=False
+        tuple(fresh_params.values()),
+        retain_graph=False,   # release graph completely
+        allow_unused=True
     )
 
-    hv_vec = torch.nn.utils.parameters_to_vector(hv)
+    hv = tuple(
+        g if g is not None else torch.zeros_like(p)
+        for g, p in zip(hv, fresh_params.values())
+    )
 
-    # ---- Distributed reduction using TPU-native xm.all_reduce ----
+    hv_vec = torch.nn.utils.parameters_to_vector(hv).detach()
+
+    # ---- Distributed reduction ----
     if _is_tpu_distributed():
-        hv_vec = hv_vec.detach()
         hv_vec = xm.all_reduce(xm.REDUCE_SUM, hv_vec)
         world_size = xr.world_size()
         hv_vec = hv_vec / world_size
@@ -141,39 +114,57 @@ def lanczos(hvp_fn, dim, k, device):
     q = q / q.norm()
     Q[:, 0] = q
 
+    is_tpu = device.type == 'xla'
+    rank = xr.global_ordinal() if _is_tpu_distributed() else 0
+
     for j in range(k):
-        print(f"[Lanczos iteration]: {j}/{k}")
+        if rank == 0:
+            print(f"[Lanczos iteration]: {j}/{k}")
+
         q_j = Q[:, j].detach()
 
         v = hvp_fn(q_j)
 
-        alpha_j = torch.dot(q_j, v)
-        alpha[j] = alpha_j
+        # Force XLA graph execution and memory cleanup each step
+        if is_tpu:
+            xm.mark_step()
 
-        v = v - alpha_j * q_j
+        # Detach v before the dot products so we don't accumulate graph
+        v = v.detach()
+
+        alpha_j = torch.dot(q_j, v)
+        alpha[j] = alpha_j.detach()
+
+        v = v - alpha_j.detach() * q_j
 
         if j > 0:
-            v = v - beta[j-1] * Q[:, j-1]
+            v = v - beta[j-1].detach() * Q[:, j-1].detach()
 
-        # 🔁 FULL reorthogonalization (more stable)
+        # Full reorthogonalization (more stable)
         for i in range(j + 1):
-            qi = Q[:, i]
+            qi = Q[:, i].detach()
             v = v - torch.dot(qi, v) * qi
 
         if j < k - 1:
             beta_j = v.norm()
-            beta[j] = beta_j
+            beta[j] = beta_j.detach()
 
-            if beta_j < 1e-10:
-                print(f"Early exit at step {j}")
+            if beta_j.item() < 1e-10:
+                if rank == 0:
+                    print(f"Early exit at step {j}")
                 Q = Q[:, :j+1]
                 alpha = alpha[:j+1]
                 beta = beta[:j]
                 break
 
-            Q[:, j+1] = v / beta_j
+            Q[:, j+1] = (v / beta_j).detach()
 
-    print(f"Rank of Lanczos: {Q.shape[1]}")
+        # Force step after each iteration to bound graph size on XLA
+        if is_tpu:
+            xm.mark_step()
+
+    if rank == 0:
+        print(f"Rank of Lanczos: {Q.shape[1]}")
 
     # build tridiagonal
     T = torch.diag(alpha)
@@ -184,22 +175,20 @@ def lanczos(hvp_fn, dim, k, device):
     return T, Q
 
 
-
-
 def compute_Q_for_task(model, k, device, train_loader):
     model.eval()
-    
+
     inputs, targets = next(iter(train_loader))
-    inputs = inputs.to(device)
+    inputs  = inputs.to(device)
     targets = targets.to(device)
-    
-    # params = model.get_backbone_params_dict()
+
+    # Snapshot backbone params once; hvp_flat re-detaches them each call
     params = {
-        k: v.detach().requires_grad_(True)
-        for k, v in model.get_backbone_params_dict().items()
+        name: p.detach()
+        for name, p in model.get_backbone_params_dict().items()
     }
     param_dim = sum(p.numel() for p in params.values())
-    
+
     def hvp_operator(v):
         return hvp_flat(
             v,
@@ -216,26 +205,31 @@ def compute_Q_for_task(model, k, device, train_loader):
         k=k,
         device=device
     )
-    # print(f"Lanczos compute time is: {t2-t1}")
 
-    # Compute eigenvalues from the tridiagonal matrix T
-    # The Ritz values (eigenvalues of T) approximate Hessian eigenvalues
+    # Mark step to free memory before eigendecomposition
+    if device.type == 'xla':
+        xm.mark_step()
+
     # Offload to CPU for TPU/MPS compatibility with eigh
     offload_to_cpu = T.device.type in ('xla', 'mps')
     original_device = T.device
 
     if offload_to_cpu:
-        T = T.detach().cpu()
+        T       = T.detach().cpu()
+        Q_basis = Q_basis.detach().cpu()
 
     eigvals, eigvecs = torch.linalg.eigh(T)
 
-    if offload_to_cpu:
-        eigvals = eigvals.to(original_device)
-        eigvecs = eigvecs.to(original_device)
-
-    # Reorder Q_basis columns to match descending eigenvalue order
-    idx = torch.argsort(eigvals, descending=True)
+    # Reorder to descending eigenvalue order
+    idx     = torch.argsort(eigvals, descending=True)
     eigvals = eigvals[idx]
-    Q_basis = Q_basis[:, idx]
+    eigvecs = eigvecs[:, idx]
 
-    return Q_basis.to(torch.float32), eigvals.to(torch.float32)
+    # Lift Ritz vectors back to full parameter space: Q_basis @ eigvecs
+    Q_full = Q_basis @ eigvecs      # (param_dim, k)
+
+    if offload_to_cpu:
+        Q_full  = Q_full.to(original_device)
+        eigvals = eigvals.to(original_device)
+
+    return Q_full.to(torch.float32), eigvals.to(torch.float32)

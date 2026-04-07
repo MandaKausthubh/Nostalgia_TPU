@@ -4,12 +4,19 @@ import torch_xla.core.xla_model as xm
 from typing import Optional, Tuple
 import torch
 
+
 def broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
-    """Broadcast from master to all replicas (simple version)"""
+    """Broadcast a tensor from src rank to all replicas using all_reduce trick."""
     if xr.world_size() == 1:
         return tensor
-    tensor = tensor.clone() if tensor is not None else torch.tensor(0.0, device=xm.xla_device())
-    xm.broadcast(tensor, src=src)
+
+    rank = xr.global_ordinal()
+
+    # XLA doesn't have a direct broadcast; we zero out non-src ranks and all_reduce(SUM)
+    if rank != src:
+        tensor = torch.zeros_like(tensor)
+
+    tensor = xm.all_reduce(xm.REDUCE_SUM, tensor)
     return tensor
 
 
@@ -19,52 +26,71 @@ def broadcast_Q_Lambda(
     src: int = 0
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
-    Broadcast Q and Lambda tensors from source rank to all other ranks.
+    Broadcast Q and Lambda tensors from source rank (src) to all other ranks.
 
-    All ranks must call this function. The source rank (typically rank 0)
-    provides the data, and all other ranks receive it.
+    All ranks MUST call this function.  The source rank (rank 0 by default)
+    holds valid tensors; every other rank contributes zeros that get summed
+    away by all_reduce(SUM), leaving only the src values.
 
     Args:
-        Q: Eigenvector matrix [N, k] on source rank, None on others
-        Lambda: Eigenvalue tensor on source rank, None on others
-        src: Source rank to broadcast from (default: 0)
+        Q:      Eigenvector matrix [N, k] on src rank; can be None on others.
+        Lambda: Eigenvalue tensor   [k]   on src rank; can be None on others.
+        src:    Source rank (default 0).
 
     Returns:
-        Tuple of (Q, Lambda) - all ranks receive the same tensors
+        (Q, Lambda) – identical tensors on every rank.
     """
     world_size = xr.world_size()
     if world_size == 1:
         return Q, Lambda
 
     rank = xr.global_ordinal()
+    device = xm.xla_device()
 
-    # Determine shapes from source rank
+    # ------------------------------------------------------------------ #
+    # Step 1 – broadcast shape metadata using scalar all_reduces           #
+    # ------------------------------------------------------------------ #
     if rank == src:
-        q_shape = torch.tensor(Q.shape if Q is not None else (0, 0), device=xm.xla_device(), dtype=torch.long)
-        lambda_shape = torch.tensor(Lambda.shape if Lambda is not None else (0,), device=xm.xla_device(), dtype=torch.long)
-        q_exists = torch.tensor(1 if Q is not None else 0, device=xm.xla_device(), dtype=torch.long)
-        lambda_exists = torch.tensor(1 if Lambda is not None else 0, device=xm.xla_device(), dtype=torch.long)
+        assert Q is not None and Lambda is not None, \
+            "Source rank must have valid Q and Lambda tensors"
+        N, k = Q.shape
     else:
-        q_shape = torch.zeros(2, device=xm.xla_device(), dtype=torch.long)
-        lambda_shape = torch.zeros(1, device=xm.xla_device(), dtype=torch.long)
-        q_exists = torch.tensor(0, device=xm.xla_device(), dtype=torch.long)
-        lambda_exists = torch.tensor(0, device=xm.xla_device(), dtype=torch.long)
+        N, k = 0, 0
 
-    # Broadcast metadata first
-    xm.broadcast(q_shape, src=src)
-    xm.broadcast(lambda_shape, src=src)
-    xm.broadcast(q_exists, src=src)
-    xm.broadcast(lambda_exists, src=src)
+    # Exchange N and k via all_reduce (only src contributes the real values)
+    N_t = torch.tensor(float(N), device=device)
+    k_t = torch.tensor(float(k), device=device)
+    N_t = xm.all_reduce(xm.REDUCE_SUM, N_t)
+    k_t = xm.all_reduce(xm.REDUCE_SUM, k_t)
+    xm.mark_step()
 
-    # Broadcast actual tensors if they exist
-    if q_exists.item() == 1:
-        if rank != src:
-            Q = torch.zeros(q_shape[0].item(), q_shape[1].item(), device=xm.xla_device(), dtype=torch.float32)
-        xm.broadcast(Q, src=src)
+    N_global = int(N_t.item())
+    k_global = int(k_t.item())
 
-    if lambda_exists.item() == 1:
-        if rank != src:
-            Lambda = torch.zeros(lambda_shape[0].item(), device=xm.xla_device(), dtype=torch.float32)
-        xm.broadcast(Lambda, src=src)
+    if N_global == 0 or k_global == 0:
+        # Nothing to broadcast (e.g. first task, Q/Lambda are None everywhere)
+        return Q, Lambda
 
-    return Q, Lambda
+    # ------------------------------------------------------------------ #
+    # Step 2 – broadcast Q                                                 #
+    # ------------------------------------------------------------------ #
+    if rank == src:
+        Q_bcast = Q.to(device=device, dtype=torch.float32)
+    else:
+        Q_bcast = torch.zeros(N_global, k_global, device=device, dtype=torch.float32)
+
+    Q_bcast = xm.all_reduce(xm.REDUCE_SUM, Q_bcast)
+    xm.mark_step()
+
+    # ------------------------------------------------------------------ #
+    # Step 3 – broadcast Lambda                                            #
+    # ------------------------------------------------------------------ #
+    if rank == src:
+        L_bcast = Lambda.to(device=device, dtype=torch.float32)
+    else:
+        L_bcast = torch.zeros(k_global, device=device, dtype=torch.float32)
+
+    L_bcast = xm.all_reduce(xm.REDUCE_SUM, L_bcast)
+    xm.mark_step()
+
+    return Q_bcast, L_bcast
