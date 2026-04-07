@@ -94,6 +94,12 @@ class NostalgiaExperiment:
         else:
             self.writer = None
         self.finished_domains = []
+
+        # EMA smoothing for training metrics
+        self.ema_loss: Optional[float] = None
+        self.ema_accuracy: Optional[float] = None
+        self.ema_beta: float = 0.9  # Higher = smoother
+
         xm.master_print(f"Initialized on device: {self.device}, world_size={self.config.world_size}")
 
 
@@ -358,6 +364,10 @@ class NostalgiaExperiment:
             self.finished_domains.append(domain)
             self.train_taskhead(domain, self.config.head_warmup_epochs, rank)
 
+            # Reset EMA for new domain
+            self.ema_loss = None
+            self.ema_accuracy = None
+
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer.base_optimizer,
                 T_max=len(self.current_train_loader) * self.config.num_epochs,
@@ -366,8 +376,18 @@ class NostalgiaExperiment:
 
             xm.master_print(f"\n========== Full Training: ===========")
 
+            # Calculate dynamic logging interval for ~50 logs per epoch
+            steps_per_epoch = len(self.current_train_loader)
+            log_interval = max(1, steps_per_epoch // 50)
+            xm.master_print(f"Steps per epoch: {steps_per_epoch}, Logging every {log_interval} steps")
+
             for epoch in range(self.config.num_epochs):
                 self.current_train_sampler.set_epoch(epoch)
+
+                # Track running sums for this epoch (for efficient averaging)
+                epoch_loss_sum = 0.0
+                epoch_acc_sum = 0.0
+                epoch_step_count = 0
 
                 for step, batch in enumerate(self.current_train_loader):
                     images, labels = batch
@@ -380,18 +400,43 @@ class NostalgiaExperiment:
 
                     global_step += 1
 
-                    if step % 100 == 0 and xm.is_master_ordinal():
-                        print(f"Domain {domain} | Ep {epoch} | Step {global_step} | Loss {loss.item():.4f} | Acc {accuracy.item()*100:.4f}%")
-                        if self.writer is not None:
-                            self.writer.add_scalars(domain, {
-                                f'Training_Loss'    : loss.item(),
-                                f'Training_Accuracy': accuracy.item(),
-                                f'LR'               : scheduler.get_last_lr()[0]
-                            }, global_step)
+                    # Update local running averages
+                    loss_value = loss.item()
+                    acc_value = accuracy.item()
+                    epoch_loss_sum += loss_value
+                    epoch_acc_sum += acc_value
+                    epoch_step_count += 1
 
-                    if step % 200 == 0:
-                        # Run evaluation on all test datasets (past, current, and future)
-                        # if xm.is_master_ordinal():
+                    # Update local EMA
+                    if self.ema_loss is None:
+                        self.ema_loss = loss_value
+                        self.ema_accuracy = acc_value
+                    else:
+                        self.ema_loss = self.ema_beta * self.ema_loss + (1 - self.ema_beta) * loss_value
+                        self.ema_accuracy = self.ema_beta * self.ema_accuracy + (1 - self.ema_beta) * acc_value
+
+                    if step % log_interval == 0:
+                        # Aggregate EMA and running averages across all TPU cores at log time
+                        global_ema_loss = xm.mesh_reduce('ema_loss', self.ema_loss, sum) / self.config.world_size
+                        global_ema_acc = xm.mesh_reduce('ema_acc', self.ema_accuracy, sum) / self.config.world_size
+                        global_avg_loss = xm.mesh_reduce('avg_loss', epoch_loss_sum / epoch_step_count, sum) / self.config.world_size
+                        global_avg_acc = xm.mesh_reduce('avg_acc', epoch_acc_sum / epoch_step_count, sum) / self.config.world_size
+
+                        if xm.is_master_ordinal():
+                            print(f"Domain {domain} | Ep {epoch} | Step {step}/{steps_per_epoch} | "
+                                  f"Loss {global_ema_loss:.4f} | Acc {global_ema_acc*100:.2f}% | "
+                                  f"LR {scheduler.get_last_lr()[0]:.2e}")
+                            if self.writer is not None:
+                                self.writer.add_scalars(domain, {
+                                    f'Training_Loss_EMA'    : global_ema_loss,
+                                    f'Training_Acc_EMA'     : global_ema_acc,
+                                    f'Training_Loss_Avg'    : global_avg_loss,
+                                    f'Training_Acc_Avg'     : global_avg_acc,
+                                    f'LR'                   : scheduler.get_last_lr()[0]
+                                }, global_step)
+
+                    if step % (log_interval * 10) == 0 and step > 0:
+                        # Run evaluation on all test datasets (less frequent)
                         result, acc, loss = self.evaluate_all_seen(criterion, rank)
                         xm.master_print(f"Validation Score | Loss: {result[domain]['Test_Loss']:.4f} | Accuracy: {result[domain]['Test_Accuracy']:.4f}%")
                         for eval_domain, metrics in result.items():
