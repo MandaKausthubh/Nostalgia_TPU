@@ -451,22 +451,27 @@ class NostalgiaExperiment:
                         self.ema_accuracy = self.ema_beta * self.ema_accuracy + (1 - self.ema_beta) * acc_value
 
                     if step % log_interval == 0:
-                        # Aggregate EMA and running averages across all TPU cores at log time
+                        # Aggregate EMA, running averages, and per-step values across all TPU cores
                         global_ema_loss  = xm.mesh_reduce('ema_loss',  self.ema_loss,                                    sum) / self.config.world_size
                         global_ema_acc   = xm.mesh_reduce('ema_acc',   self.ema_accuracy,                               sum) / self.config.world_size
                         global_avg_loss  = xm.mesh_reduce('avg_loss',  epoch_loss_sum / epoch_step_count,               sum) / self.config.world_size
                         global_avg_acc   = xm.mesh_reduce('avg_acc',   epoch_acc_sum  / epoch_step_count,               sum) / self.config.world_size
+                        global_step_loss = xm.mesh_reduce('step_loss', loss_value,                                       sum) / self.config.world_size
+                        global_step_acc  = xm.mesh_reduce('step_acc',  acc_value,                                        sum) / self.config.world_size
                         global_grad_norm = xm.mesh_reduce('grad_norm', grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm, sum) / self.config.world_size
 
                         if xm.is_master_ordinal():
                             current_lr = scheduler.get_last_lr()[0]
                             print(
                                 f"Domain {domain} | Ep {epoch} | Step {step}/{steps_per_epoch} | "
-                                f"Loss {global_ema_loss:.4f} | Acc {global_ema_acc*100:.2f}% | "
+                                f"Loss(step/ema) {global_step_loss:.4f}/{global_ema_loss:.4f} | "
+                                f"Acc(step/ema) {global_step_acc*100:.2f}/{global_ema_acc*100:.2f}% | "
                                 f"GradNorm {global_grad_norm:.3f} | LR {current_lr:.2e}"
                             )
                             if self.writer is not None:
                                 self.writer.add_scalars(domain, {
+                                    'Training_Loss_Step'  : global_step_loss,
+                                    'Training_Acc_Step'   : global_step_acc,
                                     'Training_Loss_EMA'   : global_ema_loss,
                                     'Training_Acc_EMA'    : global_ema_acc,
                                     'Training_Loss_Avg'   : global_avg_loss,
