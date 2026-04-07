@@ -364,17 +364,42 @@ class NostalgiaExperiment:
             self.finished_domains.append(domain)
             self.train_taskhead(domain, self.config.head_warmup_epochs, rank)
 
+            # Switch backbone back to train() mode after task-head warmup
+            # (train_taskhead puts backbone in eval() to freeze BN/dropout)
+            self.model.backbone.train()
+            self.model.set_active_task(domain)   # re-enable head grad after warmup
+
             # Reset EMA for new domain
             self.ema_loss = None
             self.ema_accuracy = None
 
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            steps_per_epoch = len(self.current_train_loader)
+            total_steps     = steps_per_epoch * self.config.num_epochs
+            warmup_steps    = min(self.config.warmup_steps, total_steps // 10)
+
+            # Linear warmup → Cosine decay schedule
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer.base_optimizer,
-                T_max=len(self.current_train_loader) * self.config.num_epochs,
-                eta_min=1e-6
+                start_factor = 0.1,
+                end_factor   = 1.0,
+                total_iters  = warmup_steps,
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer.base_optimizer,
+                T_max   = max(1, total_steps - warmup_steps),
+                eta_min = self.config.lr * 0.01,   # decay to 1% of peak LR
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer.base_optimizer,
+                schedulers  = [warmup_scheduler, cosine_scheduler],
+                milestones  = [warmup_steps],
             )
 
-            xm.master_print(f"\n========== Full Training: ===========")
+            xm.master_print(
+                f"\n========== Full Training [{domain}]: "
+                f"{total_steps} steps | warmup={warmup_steps} | "
+                f"lr={self.config.lr:.1e} → {self.config.lr*0.01:.1e} =========="
+            )
 
             # Calculate dynamic logging interval for ~50 logs per epoch
             steps_per_epoch = len(self.current_train_loader)
@@ -391,10 +416,20 @@ class NostalgiaExperiment:
 
                 for step, batch in enumerate(self.current_train_loader):
                     images, labels = batch
-                    loss, accuracy = self.compute_loss_accuracy(domain, images, labels, criterion)
 
                     optimizer.zero_grad()
+                    loss, accuracy = self.compute_loss_accuracy(domain, images, labels, criterion)
                     loss.backward()
+
+                    # ── Gradient clipping ─────────────────────────────────
+                    # Collect all backbone + active head params with grads.
+                    all_params = list(self.model.backbone.parameters()) + \
+                                 list(self.model.task_head_list[domain].parameters())
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        all_params,
+                        max_norm = self.config.grad_clip_norm,
+                    )
+
                     xm.optimizer_step(optimizer)
                     scheduler.step()
 
@@ -417,22 +452,27 @@ class NostalgiaExperiment:
 
                     if step % log_interval == 0:
                         # Aggregate EMA and running averages across all TPU cores at log time
-                        global_ema_loss = xm.mesh_reduce('ema_loss', self.ema_loss, sum) / self.config.world_size
-                        global_ema_acc = xm.mesh_reduce('ema_acc', self.ema_accuracy, sum) / self.config.world_size
-                        global_avg_loss = xm.mesh_reduce('avg_loss', epoch_loss_sum / epoch_step_count, sum) / self.config.world_size
-                        global_avg_acc = xm.mesh_reduce('avg_acc', epoch_acc_sum / epoch_step_count, sum) / self.config.world_size
+                        global_ema_loss  = xm.mesh_reduce('ema_loss',  self.ema_loss,                                    sum) / self.config.world_size
+                        global_ema_acc   = xm.mesh_reduce('ema_acc',   self.ema_accuracy,                               sum) / self.config.world_size
+                        global_avg_loss  = xm.mesh_reduce('avg_loss',  epoch_loss_sum / epoch_step_count,               sum) / self.config.world_size
+                        global_avg_acc   = xm.mesh_reduce('avg_acc',   epoch_acc_sum  / epoch_step_count,               sum) / self.config.world_size
+                        global_grad_norm = xm.mesh_reduce('grad_norm', grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm, sum) / self.config.world_size
 
                         if xm.is_master_ordinal():
-                            print(f"Domain {domain} | Ep {epoch} | Step {step}/{steps_per_epoch} | "
-                                  f"Loss {global_ema_loss:.4f} | Acc {global_ema_acc*100:.2f}% | "
-                                  f"LR {scheduler.get_last_lr()[0]:.2e}")
+                            current_lr = scheduler.get_last_lr()[0]
+                            print(
+                                f"Domain {domain} | Ep {epoch} | Step {step}/{steps_per_epoch} | "
+                                f"Loss {global_ema_loss:.4f} | Acc {global_ema_acc*100:.2f}% | "
+                                f"GradNorm {global_grad_norm:.3f} | LR {current_lr:.2e}"
+                            )
                             if self.writer is not None:
                                 self.writer.add_scalars(domain, {
-                                    f'Training_Loss_EMA'    : global_ema_loss,
-                                    f'Training_Acc_EMA'     : global_ema_acc,
-                                    f'Training_Loss_Avg'    : global_avg_loss,
-                                    f'Training_Acc_Avg'     : global_avg_acc,
-                                    f'LR'                   : scheduler.get_last_lr()[0]
+                                    'Training_Loss_EMA'   : global_ema_loss,
+                                    'Training_Acc_EMA'    : global_ema_acc,
+                                    'Training_Loss_Avg'   : global_avg_loss,
+                                    'Training_Acc_Avg'    : global_avg_acc,
+                                    'Grad_Norm'           : global_grad_norm,
+                                    'LR'                  : current_lr,
                                 }, global_step)
 
                     if step % (log_interval * 10) == 0 and step > 0:

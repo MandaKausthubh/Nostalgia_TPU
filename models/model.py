@@ -18,36 +18,68 @@ class NostalgiaConfig:
     mode: str = 'nostalgia'
     seed: int = 42
     root_dir: str = '/kaggle/input/datasets/kausthubhmanda/domainnet-fulldataset'
+
+    # ── Batch / workers ──────────────────────────────────────────────────
+    # 512 total split across 8 TPU cores → 64 per core.
+    # DomainNet images are 224×224; 64 per core is safe for v3-8 HBM.
     batch_size: int = 512
     batch_size_for_accumulation: int = 16
-    lr: float = 1e-5
-    downstream_lr: float = 1e-3
-    base_optimizer: str = 'sgd'
-    weight_decay: float = 1e-4
-    num_epochs: int = 5 # 25
+    num_workers: int = 4
+
+    # ── Learning rates ───────────────────────────────────────────────────
+    # Backbone: small LR for fine-tuning pre-trained ViT through LoRA.
+    # 3e-5 is proven safe for ViT-Base with AdamW; 1e-5 is too conservative
+    # and causes the 'accuracy decreasing' symptom seen in the graphs.
+    lr: float = 3e-5
+    # Task head: larger LR, trained from scratch on top of frozen features.
+    downstream_lr: float = 3e-4
+
+    # ── Optimiser ────────────────────────────────────────────────────────
+    # AdamW with decoupled weight decay is the standard for ViT fine-tuning.
+    base_optimizer: str = 'adamw'
+    # 1e-2 is the canonical AdamW weight decay for ViT (Dosovitskiy et al.).
+    weight_decay: float = 1e-2
+
+    # ── Training schedule ────────────────────────────────────────────────
+    # 10 epochs per domain; with 5 domains total = 50 effective epochs.
+    num_epochs: int = 10
+    # Warmup: train ONLY the task head for 3 epochs before unlocking backbone.
+    # Prevents the backbone from being corrupted by a random linear head.
+    head_warmup_epochs: int = 3
+
     device: str = 'mps'
     validate_after_steps: int = 10
     log_deltas: bool = True
-    num_workers: int = 4
 
-    hessian_eigenspace_dim: int = 16
-    moving_average_hessians_epochs: int = 5
-    gamma: torch.float32 = 0.9
+    # ── Gradient clipping ────────────────────────────────────────────────
+    # Standard for ViT training; prevents gradient explosion during early steps.
+    grad_clip_norm: float = 1.0
 
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.1
+    # ── Warmup steps for LR scheduler ───────────────────────────────────
+    # Linear warmup for the first ~5% of steps stabilises early training.
+    warmup_steps: int = 100
+
+    # ── LoRA ─────────────────────────────────────────────────────────────
+    # r=16 gives a better capacity/efficiency tradeoff than r=8 for DomainNet.
+    # alpha = 2×r is the standard initialisation scale.
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05   # light dropout; heavy dropout hurts small r
     lora_modules: Optional[list] = None
 
     ewc_lambda: float = 1e-4
     l2sp_lambda: float = 1e-4
     reset_lora: bool = True
-    head_warmup_epochs: int = 1 # 10
 
-    accumulate_mode: str = 'accumulate'  # or 'union'
-    merge_tasks: str = 'union'  # or 'accumulate'
+    # ── Hessian / Nostalgia ───────────────────────────────────────────────
+    hessian_eigenspace_dim: int = 16
+    moving_average_hessians_epochs: int = 5
+    gamma: torch.float32 = 0.9
     iterations_of_accumulation: int = 4
     use_scaling: bool = True
+
+    accumulate_mode: str = 'accumulate'  # or 'union'
+    merge_tasks: str = 'union'           # or 'accumulate'
     adapt_downstream_tasks: bool = False
     log_dir: str = f'logs/nostalgia_vision_experiment/{mode}/{lr}/{lora_r}/{hessian_eigenspace_dim}/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
 
@@ -98,7 +130,7 @@ class ContinualLearnerViT(nn.Module):
 
         self.use_nostalgia = True
         self.use_preprocessor = False
-        self.weight_decay = 0.0
+        self.weight_decay = 1e-2   # AdamW canonical weight decay for ViT
 
         self.task_head_list = torch.nn.ModuleDict()
         self.active_task  = None
@@ -205,28 +237,35 @@ class ContinualLearnerViT(nn.Module):
         if self.optimizer_type == "sgd":
             base_optimizer = torch.optim.SGD(
                 [
-                    {"params": backbone_params, "lr": self.learning_rate},
-                    {"params": head_params, "lr": self.downstream_learning_rate},
+                    {"params": backbone_params, "lr": self.learning_rate,
+                     "weight_decay": self.weight_decay},
+                    {"params": head_params, "lr": self.downstream_learning_rate,
+                     "weight_decay": self.weight_decay},
                 ],
                 momentum=0.9,
-                weight_decay=0.0,
                 nesterov=True,
             )
         elif self.optimizer_type == "adamw":
             base_optimizer = torch.optim.AdamW(
                 [
-                    {"params": backbone_params, "lr": self.learning_rate},
-                    {"params": head_params, "lr": self.downstream_learning_rate},
+                    {"params": backbone_params, "lr": self.learning_rate,
+                     "weight_decay": self.weight_decay},
+                    # Task-head linear layer: no weight decay on bias,
+                    # but applying to weights is fine and standard.
+                    {"params": head_params, "lr": self.downstream_learning_rate,
+                     "weight_decay": 0.0},   # head trained from scratch – skip decay
                 ],
-                weight_decay=0.0,
+                betas=(0.9, 0.999),
+                eps=1e-8,
             )
         elif self.optimizer_type == "adam":
             base_optimizer = torch.optim.Adam(
                 [
-                    {"params": backbone_params, "lr": self.learning_rate},
-                    {"params": head_params, "lr": self.downstream_learning_rate},
+                    {"params": backbone_params, "lr": self.learning_rate,
+                     "weight_decay": self.weight_decay},
+                    {"params": head_params, "lr": self.downstream_learning_rate,
+                     "weight_decay": 0.0},
                 ],
-                weight_decay=0.0,
             )
         else:
             raise ValueError(f"Unsupported optimizer type: {self.optimizer_type}")
