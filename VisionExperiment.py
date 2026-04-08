@@ -329,7 +329,8 @@ class NostalgiaExperiment:
                 xm.optimizer_step(optimizer)
                 scheduler.step()
                 if step_iter%10==0:
-                    xm.master_print(f'\tTask headtraining loss at step {step_iter}: {loss.item():.4f}')
+                    # xm.master_print(f'\tTask headtraining loss at step {step_iter}: {loss.item():.4f}')
+                    pass
                 step_iter+=1
 
 
@@ -462,12 +463,12 @@ class NostalgiaExperiment:
 
                         if xm.is_master_ordinal():
                             current_lr = scheduler.get_last_lr()[0]
-                            print(
-                                f"Domain {domain} | Ep {epoch} | Step {step}/{steps_per_epoch} | "
-                                f"Loss(step/ema) {global_step_loss:.4f}/{global_ema_loss:.4f} | "
-                                f"Acc(step/ema) {global_step_acc*100:.2f}/{global_ema_acc*100:.2f}% | "
-                                f"GradNorm {global_grad_norm:.3f} | LR {current_lr:.2e}"
-                            )
+                            # print(
+                            #     f"Domain {domain} | Ep {epoch} | Step {step}/{steps_per_epoch} | "
+                            #     f"Loss(step/ema) {global_step_loss:.4f}/{global_ema_loss:.4f} | "
+                            #     f"Acc(step/ema) {global_step_acc*100:.2f}/{global_ema_acc*100:.2f}% | "
+                            #     f"GradNorm {global_grad_norm:.3f} | LR {current_lr:.2e}"
+                            # )
                             if self.writer is not None:
                                 self.writer.add_scalars(domain, {
                                     'Training_Loss_Step'  : global_step_loss,
@@ -493,6 +494,11 @@ class NostalgiaExperiment:
 
                 # Full recomputation
             Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
+            qtq = Q_curr.T @ Q_curr
+            eye = torch.eye(qtq.shape[0], device=qtq.device, dtype=qtq.dtype)
+
+            orth_err = (qtq - eye).abs().max()
+            xm.master_print("max orthogonality error =", orth_err.item())
 
                 # For EMA style updates
                 # Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
