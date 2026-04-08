@@ -147,16 +147,10 @@ class NostalgiaOptimizer(Optimizer):
                     )
 
                 if self.step_count % self.log_every == 0:
-                    self.writter.add_scalar(
-                        'Nostalgia/Projection_Ratio',
-                        ratio,
-                        self.step_count
-                    )
-                    self.writter.add_scalar(
-                        'Nostalgia/Projection_Ratio_EMA',
-                        self.proj_ratio_ema,
-                        self.step_count
-                    )
+                    self.writter.add_scalars('Nostalgia', {
+                        'Projection_Ratio':     ratio,
+                        'Projection_Ratio_EMA': self.proj_ratio_ema,
+                    }, self.step_count)
 
         self.step_count += 1
         return self.base_optimizer.step(closure)
