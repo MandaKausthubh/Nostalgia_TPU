@@ -109,4 +109,14 @@ def accumulate_hessian_eigenspace(
     # Lift eigenvectors back to full space
     Q_t = B @ eigvecs            # (N × k)
 
+    if offload_to_cpu:
+        print(f"[Accumulate] Moving Q_t to CPU for QR decomposition [Normalisation]... {original_device.type} compatibility")
+        Q_t = Q_t.detach().cpu()
+
+    Q_t, _ = torch.linalg.qr(Q_t, mode="reduced")
+
+    if offload_to_cpu:
+        print(f"[Accumulate] Moving Q_t to Device for return... {original_device.type} compatibility")
+        Q_t = Q_t.to(original_device)
+
     return Q_t, eigvals
