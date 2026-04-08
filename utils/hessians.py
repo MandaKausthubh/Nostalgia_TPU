@@ -261,4 +261,9 @@ def compute_Q_for_task(model, k, device, train_loader):
     Q_full = Q_full.to(device=device, dtype=torch.float32)
     eigvals = eigvals.to(device=device, dtype=torch.float32)
 
+    qtq = Q_full.T @ Q_full
+    eye = torch.eye(qtq.shape[0], device=qtq.device)
+    err = (qtq - eye).abs().max()
+    print(f"[compute_Q_for_task] Q_full orthogonality error: {err.item():.7e}")
+
     return Q_full, eigvals
