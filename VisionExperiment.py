@@ -135,7 +135,7 @@ class NostalgiaExperiment:
             t2 = time.time()
 
             if rank == 0:
-                Q, Lambda = accumulate_hessian_eigenspace(
+                Q, Lambda = accumulate_hessian_eigenspace_stable(
                     Q_old=Q, Lambda_old=Lambda,
                     Q_new=Q_new.to(device=self.device), Lambda_new=Lambda_new.to(device=self.device),
                     t=(epoch+1), k=self.config.hessian_eigenspace_dim,
@@ -160,10 +160,10 @@ class NostalgiaExperiment:
         Q, Lambda = None, None
         for i, domain in enumerate(past_domains):
             Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(domain, rank)
-            Q, Lambda = accumulate_hessian_eigenspace(
+            Q, Lambda = accumulate_hessian_eigenspace_stable(
                 Q_old=Q, Lambda_old=Lambda,
                 Q_new=Q_new, Lambda_new=Lambda_new,
-                t = (i+1), alpha_scaling=1.0+1e-2, beta_scaling=1.0-1e-2,
+                t = (i+1),
                 k = self.config.hessian_eigenspace_dim,
             )
         return Q, Lambda

@@ -7,122 +7,195 @@ def _needs_cpu_offload(tensor: torch.Tensor) -> bool:
     # TPU ('xla') and MPS may have issues with certain linalg operations
     return tensor.device.type in ('xla', 'mps')
 
+def _safe_qr(X: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable QR with automatic CPU offload when required.
+    Returns only Q.
+    """
+    original_device = X.device
+    original_dtype = X.dtype
 
-def accumulate_hessian_eigenspace(
+    if _needs_cpu_offload(X):
+        X_cpu = X.detach().to("cpu", dtype=torch.float32)
+        Q_cpu, _ = torch.linalg.qr(X_cpu, mode="reduced")
+        return Q_cpu.to(device=original_device, dtype=original_dtype)
+
+    Q, _ = torch.linalg.qr(X, mode="reduced")
+    return Q
+
+
+def _safe_eigh(S: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Safe symmetric eigendecomposition with automatic CPU offload.
+    """
+    original_device = S.device
+    original_dtype = S.dtype
+
+    if _needs_cpu_offload(S):
+        S_cpu = S.detach().to("cpu", dtype=torch.float32)
+        eigvals_cpu, eigvecs_cpu = torch.linalg.eigh(S_cpu)
+
+        return (
+            eigvals_cpu.to(device=original_device, dtype=original_dtype),
+            eigvecs_cpu.to(device=original_device, dtype=original_dtype),
+        )
+
+    return torch.linalg.eigh(S)
+
+
+def _diag_from_vector(v: torch.Tensor) -> torch.Tensor:
+    """
+    Converts eigenvalue vector to diagonal matrix.
+    """
+    if v.ndim == 2:
+        return v
+    return torch.diag(v)
+
+
+def accumulate_hessian_eigenspace_stable(
     Q_old: Optional[torch.Tensor],
     Lambda_old: Optional[torch.Tensor],
     Q_new: torch.Tensor,
     Lambda_new: torch.Tensor,
     t: int,
     k: int,
-    alpha_scaling: float = 1.0,
-    beta_scaling: float = 1.0,
+    eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    ACCUMULATE step from Nostalgia (Algorithm 2), flat-space version.
+    Stable ACCUMULATE step with CPU compatibility checks.
+
+    Maintains:
+        H_bar_t = ((t-1)/t) * H_bar_{t-1} + (1/t) * H_t
+
+    using a numerically stable low-rank eigenspace update.
 
     Args:
-        Q_old: (N, k_old) eigenvectors of previous average Hessian, or None
-        Lambda_old: (k_old,) eigenvalues, or None
-        Q_new: (N, k_new) eigenvectors of current task Hessian
-        Lambda_new: (k_new,) eigenvalues of current task Hessian
-        t: task index (1-based, t >= 1)
-        k: rank to retain
+        Q_old: (N, k_old) previous basis
+        Lambda_old: (k_old,) previous eigenvalues
+        Q_new: (N, k_new) new task basis
+        Lambda_new: (k_new,) new eigenvalues
+        t: task index (1-based)
+        k: rank cap
+        eps: numerical threshold
 
     Returns:
-        Q_t: (N, k) updated eigenvectors
-        Lambda_t: (k,) updated eigenvalues
+        Q_t: (N, k_eff) orthonormal basis
+        Lambda_t: (k_eff,) eigenvalues
     """
 
-    # --------------------------------------------------
-    # First task: nothing to accumulate
-    # --------------------------------------------------
-    if Q_old is None or Lambda_old is None:
-        return Q_new[:, :k], Lambda_new[:k]
-
-    # Ensure Lambda are 1D eigenvalue vectors (not tridiagonal or diagonal matrices)
-    if Lambda_old.ndim == 2:
-        Lambda_old = Lambda_old.diag() if Lambda_old.shape[0] == Lambda_old.shape[1] else Lambda_old.squeeze()
+    # -----------------------------
+    # sanitize eigenvalues
+    # -----------------------------
     if Lambda_new.ndim == 2:
-        Lambda_new = Lambda_new.diag() if Lambda_new.shape[0] == Lambda_new.shape[1] else Lambda_new.squeeze()
+        Lambda_new = torch.diag(Lambda_new)
 
-    # Convert to diagonal matrices for matrix operations
-    Lambda_old_diag = torch.diag(Lambda_old)
-    Lambda_new_diag = torch.diag(Lambda_new)
+    Q_new = _safe_qr(Q_new)
 
-    # --------------------------------------------------
-    # Weighting coefficients for running average
-    # --------------------------------------------------
-    alpha = alpha_scaling * (t - 1) / t
-    beta = beta_scaling / t
+    # -----------------------------
+    # first task
+    # -----------------------------
+    if Q_old is None or Lambda_old is None:
+        k_eff = min(k, Q_new.shape[1], Lambda_new.shape[0])
 
-    Lambda_old_diag = alpha * Lambda_old_diag
-    Lambda_new_diag = beta * Lambda_new_diag
+        qtq = Q_new[:, :k_eff].T @ Q_new[:, :k_eff]
+        err = (
+            qtq
+            - torch.eye(
+                qtq.shape[0],
+                device=qtq.device,
+                dtype=qtq.dtype,
+            )
+        ).abs().max()
 
-    # --------------------------------------------------
-    # Merge subspaces
-    # --------------------------------------------------
-    # M = [Q_old, Q_new] ∈ R^{N × (k_old + k_new)}
-    M = torch.cat([Q_old, Q_new], dim=1)
+        print(f"[ACCUMULATE first] orth error = {err.item():.6e}")
 
-    # Orthonormal basis of merged subspace
-    # B ∈ R^{N × r}, r ≤ k_old + k_new
-    original_device = Q_new.device
-    offload_to_cpu = _needs_cpu_offload(M)
+        return Q_new[:, :k_eff], Lambda_new[:k_eff]
 
-    if offload_to_cpu:
-        print(f"[Accumulate] Moving M to CPU for QR decomposition... {M.device.type} compatibility")
-        M = M.detach().cpu()
+    if Lambda_old.ndim == 2:
+        Lambda_old = torch.diag(Lambda_old)
 
-    B, _ = torch.linalg.qr(M, mode="reduced")
+    Q_old = _safe_qr(Q_old)
 
-    if offload_to_cpu:
-        B = B.to(original_device)
+    alpha = (t - 1) / t
+    beta = 1.0 / t
 
-    # --------------------------------------------------
-    # Project both Hessians into merged basis
-    # --------------------------------------------------
-    A_old = Q_old.T @ B          # (k_old × r)
-    A_new = Q_new.T @ B          # (k_new × r)
+    # -----------------------------
+    # remove overlap
+    # -----------------------------
+    overlap = Q_old.T @ Q_new
+    Q_res = Q_new - Q_old @ overlap
 
-    # Small matrix S ∈ R^{r × r}
-    S = A_old.T @ Lambda_old_diag @ A_old + A_new.T @ Lambda_new_diag @ A_new
+    res_norm = torch.norm(Q_res)
 
-    # --------------------------------------------------
-    # Eigendecomposition in small space
-    # --------------------------------------------------
-    if offload_to_cpu:
-        print(f"[Accumulate] Moving S to CPU for eigendecomposition... {original_device.type} compatibility")
-        S = S.detach().cpu()
+    if res_norm < eps:
+        B = Q_old
+    else:
+        Q_res = _safe_qr(Q_res)
+        B = torch.cat([Q_old, Q_res], dim=1)
+        B = _safe_qr(B)
 
-    eigvals, eigvecs = torch.linalg.eigh(S)
+    # -----------------------------
+    # small-space average Hessian
+    # -----------------------------
+    A_old = B.T @ Q_old
+    A_new = B.T @ Q_new
 
-    if offload_to_cpu:
-        eigvals = eigvals.to(original_device)
-        eigvecs = eigvecs.to(original_device)
+    Lambda_old_diag = _diag_from_vector(Lambda_old)
+    Lambda_new_diag = _diag_from_vector(Lambda_new)
 
-    # Take top-k components
-    idx = torch.argsort(eigvals, descending=True)[:k]
+    S_old = A_old @ Lambda_old_diag @ A_old.T
+    S_new = A_new @ Lambda_new_diag @ A_new.T
+
+    S = alpha * S_old + beta * S_new
+
+    # enforce symmetry
+    S = 0.5 * (S + S.T)
+
+    # -----------------------------
+    # eigendecomposition
+    # -----------------------------
+    eigvals, eigvecs = _safe_eigh(S)
+
+    idx = torch.argsort(eigvals, descending=True)
+
     eigvals = eigvals[idx]
     eigvecs = eigvecs[:, idx]
 
-    # Lift eigenvectors back to full space
-    Q_t = B @ eigvecs            # (N × k)
+    valid = eigvals > eps
 
-    if offload_to_cpu:
-        print(f"[Accumulate] Moving Q_t to CPU for QR decomposition [Normalisation]... {original_device.type} compatibility")
-        Q_t = Q_t.detach().cpu()
+    eigvals = eigvals[valid]
+    eigvecs = eigvecs[:, valid]
 
-    Q_t, _ = torch.linalg.qr(Q_t, mode="reduced")
+    if eigvals.numel() == 0:
+        print("[ACCUMULATE warning] no valid eigvals, fallback to Q_old")
+        return Q_old[:, :1], Lambda_old[:1]
 
-    print("Q_old", Q_old.dtype, Q_old.device)
-    print("Q_new", Q_new.dtype, Q_new.device)
-    print("B", B.dtype, B.device)
-    print("eigvecs", eigvecs.dtype, eigvecs.device)
-    print("Q_t", Q_t.dtype, Q_t.device)
+    k_eff = min(k, eigvals.shape[0])
 
-    if offload_to_cpu:
-        print(f"[Accumulate] Moving Q_t to Device for return... {original_device.type} compatibility")
-        Q_t = Q_t.to(original_device)
+    eigvals = eigvals[:k_eff]
+    eigvecs = eigvecs[:, :k_eff]
+
+    # -----------------------------
+    # lift back to full space
+    # -----------------------------
+    Q_t = B @ eigvecs
+
+    # mandatory final orthonormalization
+    Q_t = _safe_qr(Q_t)
+
+    # -----------------------------
+    # sanity check
+    # -----------------------------
+    qtq = Q_t.T @ Q_t
+    err = (
+        qtq
+        - torch.eye(
+            qtq.shape[0],
+            device=qtq.device,
+            dtype=qtq.dtype,
+        )
+    ).abs().max()
+
+    print(f"[ACCUMULATE stable] orth error = {err.item():.6e}")
 
     return Q_t, eigvals
