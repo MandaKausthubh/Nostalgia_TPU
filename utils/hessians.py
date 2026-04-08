@@ -246,8 +246,16 @@ def compute_Q_for_task(model, k, device, train_loader):
     xm.mark_step()
     gc.collect()
 
+    T_cpu = T.detach().cpu().float()
+    T_cpu = 0.5 * (T_cpu + T_cpu.T)
+
     # Eigendecomposition on CPU (T is small: k×k)
-    eigvals, eigvecs = torch.linalg.eigh(T)
+    eps = 1e-6
+    T_cpu += eps * torch.eye(T_cpu.shape[0])
+    eigvals, eigvecs = torch.linalg.eigh(T_cpu)
+
+    eigvals = eigvals.to(T.device)
+    eigvecs = eigvecs.to(T.device)
 
     # Reorder to descending eigenvalue order
     idx = torch.argsort(eigvals, descending=True)
