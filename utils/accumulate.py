@@ -1,4 +1,5 @@
 import torch
+import torch_xla.core.xla_model as xm
 from typing import Optional, Tuple
 
 
@@ -107,7 +108,7 @@ def accumulate_hessian_eigenspace_stable(
             )
         ).abs().max()
 
-        print(f"[ACCUMULATE first] orth error = {err.item():.6e}")
+        xm.master_print(f"[ACCUMULATE first] orth error = {err.item():.6e}")
 
         return Q_new[:, :k_eff], Lambda_new[:k_eff]
 
@@ -196,6 +197,6 @@ def accumulate_hessian_eigenspace_stable(
         )
     ).abs().max()
 
-    print(f"[ACCUMULATE stable] orth error = {err.item():.6e}")
+    xm.master_print(f"[ACCUMULATE stable] orth error = {err.item():.6e}")
 
     return Q_t, eigvals

@@ -115,8 +115,18 @@ class NostalgiaOptimizer(Optimizer):
 
             g = self._flatten_grads()
 
+            # ── NaN Detection: Skip projection if gradients are invalid ──
+            if torch.isnan(g).any() or torch.isinf(g).any():
+                print("[NostalgiaOptimizer] WARNING: NaN/Inf detected in gradients, skipping projection")
+                return self.base_optimizer.step(closure)
+
             # Q^T g
             coeffs = self.nostalgia_Q.T @ g
+
+            # ── NaN Detection: Check projection coefficients ──
+            if torch.isnan(coeffs).any() or torch.isinf(coeffs).any():
+                print("[NostalgiaOptimizer] WARNING: NaN/Inf in projection coefficients, skipping projection")
+                return self.base_optimizer.step(closure)
 
             # Optional eigenvalue-aware scaling
             if self.scaling is not None:
@@ -129,7 +139,17 @@ class NostalgiaOptimizer(Optimizer):
             # Q (Q^T g)
             projection = self.nostalgia_Q @ coeffs
 
+            # ── NaN Detection: Check final projection ──
+            if torch.isnan(projection).any() or torch.isinf(projection).any():
+                print("[NostalgiaOptimizer] WARNING: NaN/Inf in projection vector, skipping projection")
+                return self.base_optimizer.step(closure)
+
             g_projected = g - projection
+
+            # ── NaN Detection: Check projected gradients ──
+            if torch.isnan(g_projected).any() or torch.isinf(g_projected).any():
+                print("[NostalgiaOptimizer] WARNING: NaN/Inf in projected gradients, skipping projection")
+                return self.base_optimizer.step(closure)
 
             self._unflatten_to_grads(g_projected)
 

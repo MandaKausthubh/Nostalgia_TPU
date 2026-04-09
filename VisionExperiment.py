@@ -160,12 +160,20 @@ class NostalgiaExperiment:
         Q, Lambda = None, None
         for i, domain in enumerate(past_domains):
             Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(domain, rank)
-            Q, Lambda = accumulate_hessian_eigenspace_stable(
-                Q_old=Q, Lambda_old=Lambda,
-                Q_new=Q_new, Lambda_new=Lambda_new,
-                t = (i+1),
-                k = self.config.hessian_eigenspace_dim,
-            )
+
+            # Only rank 0 performs the accumulation
+            if rank == 0:
+                Q, Lambda = accumulate_hessian_eigenspace_stable(
+                    Q_old=Q, Lambda_old=Lambda,
+                    Q_new=Q_new, Lambda_new=Lambda_new,
+                    t = (i+1),
+                    k = self.config.hessian_eigenspace_dim,
+                )
+
+            # Synchronize across all ranks
+            Q, Lambda = broadcast_Q_Lambda(Q, Lambda)
+            xm.mark_step()
+
         return Q, Lambda
 
 
