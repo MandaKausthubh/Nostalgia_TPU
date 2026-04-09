@@ -124,68 +124,104 @@ class NostalgiaExperiment:
     ):
         self.prepare_dataloaders_for_domain(domain, rank)
         Q, Lambda = None, None
+        factor_blocks = []
 
         xm.master_print(f"[Rank {rank}] world_size = {xr.world_size()}")
         xm.master_print(f"[Rank {rank}] device = {self.device}")
         xm.master_print(f"\n\n=========== Computing Q Lambda for {domain} =================")
 
         for epoch in range(self.config.iterations_of_accumulation):
-
             xm.master_print(f"[Rank {rank}] Epoch Starting: {epoch}")
             self.current_train_sampler.set_epoch(epoch)
-            t1 = time.time()
-            Q_new, Lambda_new = compute_Q_for_task(
-                model=self.model, device=self.device,
-                k = self.config.hessian_eigenspace_dim,
-                train_loader = self.current_train_loader,
+            Q_epoch, Lambda_epoch = compute_Q_for_task(
+                model=self.model,
+                device=self.device,
+                k=self.config.hessian_eigenspace_dim,
+                train_loader=self.current_train_loader,
             )
-            t2 = time.time()
 
-            if rank == 0:
-                Q, Lambda = accumulate_hessian_eigenspace_stable(
-                    Q_old=Q, Lambda_old=Lambda,
-                    Q_new=Q_new.to(device=self.device), Lambda_new=Lambda_new.to(device=self.device),
-                    t=(epoch+1), k=self.config.hessian_eigenspace_dim,
-                )
+            Lambda_epoch = Lambda_epoch.clamp_min(0)
+            sqrt_lambda = torch.sqrt(Lambda_epoch)
+            F_epoch = Q_epoch * sqrt_lambda.unsqueeze(0)
 
-            # All ranks must call broadcast - rank 0 has the data, others receive it
-            print(f"[Rank {rank}] Completed epoch {epoch} for domain {domain} | Q shape: {Q.shape if Q is not None else None} | Orthogonality error: {check_orthogonality(Q) if Q is not None else 'N/A'}")
-
-            Q, Lambda = broadcast_Q_Lambda(Q, Lambda)
+            factor_blocks.append(F_epoch)
             xm.mark_step()
-            t3 = time.time()
-            if rank==0:
-                xm.master_print(
-                    f"[MASTER]Q Lambda calculation domain: {domain} | epoch: {epoch} | "
-                    f"Computing Q/L = {t2-t1:.6f} | Accumulate = {t3-t2:.6f}"
-                    f"Q shape: {Q.shape}"
-                )
+        
+        F_local = torch.cat(factor_blocks, dim=1)
+        F_local = F_local / math.sqrt(len(factor_blocks))
 
+        if rank == 0:
+            xm.master_print(f"[MASTER] | F_local shape: {F_local.shape} | F_global shape: {F_global.shape}")
+            
+        G_local = F_local.T @ F_local
+        G_global = xm.all_reduce(xm.REDUCE_SUM, G_local)
+        xm.mark_step()
+
+        eigvals, V = torch.linalg.eigh(G_global)
+        idx = torch.argsort(eigvals, descending=True)
+        eigvals = eigvals[idx]
+
+        eps = 1e-9
+        valid = eigvals > eps
+        eigvals = eigvals[valid]
+        
+        if eigvals.numel() == 0:
+            xm.master_print("[WARNING] No valid eigenvalues found, falling back to Q_old")
+        
+        k_eff = min(k, eigvals.shape[0])
+        eigvals = eigvals[:k_eff]
+        V = V[:, :k_eff]
+
+        singular_vals = torch.sqrt(eigvals)
+        Q = F_local @ V
+        Q = Q / singular_vals.unsqueeze(0)
+        
+        Q, _ = torch.linalg.qr(Q, mode="reduced")
+        Lambda = eigvals
+
+        xm.mark_step()
         return Q, Lambda
-
 
     def update_Q_Lambda_for_all_past_domains(
         self, past_domains, rank
     ):
-        Q, Lambda = None, None
+        Q_memory, Lambda_memory = None, None
+        k = self.config.hessian_eigenspace_dim
+        
         for i, domain in enumerate(past_domains):
+            xm.master_print(f"[Rank {rank}] Accumulating for domain {domain}")
             Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(domain, rank)
+            if Q_memory is None:
+                Q_memory = Q_new
+                Lambda_memory = Lambda_new
+            else:
+                t = i+1
+                alpha, beta = (t-1)/t, 1.0/t
+                sqrt_old = torch.sqrt(Lambda_memory.clamp_min(0))
+                sqrt_new = torch.sqrt(Lambda_new.clamp_min(0))
 
-            # Only rank 0 performs the accumulation
-            if rank == 0:
-                Q, Lambda = accumulate_hessian_eigenspace_stable(
-                    Q_old=Q, Lambda_old=Lambda,
-                    Q_new=Q_new, Lambda_new=Lambda_new,
-                    t = (i+1),
-                    k = self.config.hessian_eigenspace_dim,
+                F_old = (math.sqrt(alpha) * Q_memory * sqrt_old.unsqueeze(0))
+                F_new = (math.sqrt(beta) * Q_new * sqrt_new.unsqueeze(0))
+
+                F_global = torch.cat([F_old, F_new], dim=1)
+                Q_memory, Lambda_memory = recover_eigenspace_from_factor(
+                    F_global=F_global, k=k
                 )
-
-            # Synchronize across all ranks
-            Q, Lambda = broadcast_Q_Lambda(Q, Lambda)
-            print(f"[Rank {rank}] After accumulating domain {domain} | Q shape: {Q.shape if Q is not None else None} | Orthogonality error: {check_orthogonality(Q) if Q is not None else 'N/A'}")
             xm.mark_step()
 
-        return Q, Lambda
+            if rank == 0:
+                err = check_orthogonality(Q_memory)
+                xm.master_print(
+                    f"[MASTER] After domain {domain}"
+                    f"Q shape: {Q_memory.shape}"
+                    f"Lambda shape: {Lambda_memory.shape}"
+                    f"Orthogonality error: {err}"
+                )
+
+        return Q_memory, Lambda_memory
+
+                
+
 
 
     def prepare_dataloaders_for_domain(self, domain, rank):

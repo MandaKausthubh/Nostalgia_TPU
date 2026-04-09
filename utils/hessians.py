@@ -272,6 +272,106 @@ def compute_Q_for_task(model, k, device, train_loader):
     qtq = Q_full.T @ Q_full
     eye = torch.eye(qtq.shape[0], device=qtq.device)
     err = (qtq - eye).abs().max()
-    xm.master_print(f"[compute_Q_for_task] Q_full orthogonality error: {err.item():.7e}")
+    # xm.master_print(f"[compute_Q_for_task] Q_full orthogonality error: {err.item():.7e}")
 
     return Q_full, eigvals
+
+
+def update_Q_Lambda_for_all_past_domains(
+    self,
+    past_domains,
+    rank,
+):
+    """
+    Stable across-domain Hessian memory accumulation.
+
+    Computes running average:
+        H_bar_t = ((t-1)/t) H_bar_{t-1} + (1/t) H_t
+
+    using weighted PSD factor merge.
+    """
+
+    Q_memory = None
+    Lambda_memory = None
+
+    k = self.config.hessian_eigenspace_dim
+
+    for i, domain in enumerate(past_domains):
+
+        xm.master_print(
+            f"[Rank {rank}] Processing domain {domain}"
+        )
+
+        # -------------------------------------
+        # compute task/domain Hessian
+        # -------------------------------------
+        Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(
+            domain,
+            rank,
+        )
+
+        # -------------------------------------
+        # first domain
+        # -------------------------------------
+        if Q_memory is None:
+            Q_memory = Q_new
+            Lambda_memory = Lambda_new
+
+        else:
+            t = i + 1
+
+            alpha = (t - 1) / t
+            beta = 1.0 / t
+
+            # ---------------------------------
+            # weighted PSD factors
+            # ---------------------------------
+            sqrt_old = torch.sqrt(
+                Lambda_memory.clamp_min(0)
+            )
+            sqrt_new = torch.sqrt(
+                Lambda_new.clamp_min(0)
+            )
+
+            F_old = (
+                math.sqrt(alpha)
+                * Q_memory
+                * sqrt_old.unsqueeze(0)
+            )
+
+            F_new = (
+                math.sqrt(beta)
+                * Q_new
+                * sqrt_new.unsqueeze(0)
+            )
+
+            # ---------------------------------
+            # factor merge
+            # ---------------------------------
+            F_global = torch.cat(
+                [F_old, F_new],
+                dim=1,
+            )
+
+            # ---------------------------------
+            # recover low-rank eigenspace
+            # ---------------------------------
+            Q_memory, Lambda_memory = recover_eigenspace_from_factor(
+                F_global=F_global,
+                k=k,
+            )
+
+        xm.mark_step()
+
+        if rank == 0:
+            err = check_orthogonality(Q_memory)
+
+            xm.master_print(
+                f"[MASTER] After domain {domain}\n"
+                f"Q shape: {Q_memory.shape}\n"
+                f"Lambda shape: {Lambda_memory.shape}\n"
+                f"Orthogonality error: {err}"
+            )
+
+    return Q_memory, Lambda_memory
+
