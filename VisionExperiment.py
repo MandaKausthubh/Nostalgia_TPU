@@ -23,6 +23,13 @@ from models.model import ContinualLearnerViT, NostalgiaConfig
 
 
 
+def check_orthogonality(Q):
+    qtq = Q.T @ Q
+    eye = torch.eye(qtq.shape[0], device=qtq.device, dtype=qtq.dtype)
+    orth_err = (qtq - eye).abs().max()
+    return orth_err.item()
+
+
 
 class NostalgiaExperiment:
     def __init__(self, config: NostalgiaConfig):
@@ -142,6 +149,8 @@ class NostalgiaExperiment:
                 )
 
             # All ranks must call broadcast - rank 0 has the data, others receive it
+            print(f"[Rank {rank}] Completed epoch {epoch} for domain {domain} | Q shape: {Q.shape if Q is not None else None} | Orthogonality error: {check_orthogonality(Q) if Q is not None else 'N/A'}")
+
             Q, Lambda = broadcast_Q_Lambda(Q, Lambda)
             xm.mark_step()
             t3 = time.time()
@@ -151,6 +160,7 @@ class NostalgiaExperiment:
                     f"Computing Q/L = {t2-t1:.6f} | Accumulate = {t3-t2:.6f}"
                     f"Q shape: {Q.shape}"
                 )
+
         return Q, Lambda
 
 
@@ -172,6 +182,7 @@ class NostalgiaExperiment:
 
             # Synchronize across all ranks
             Q, Lambda = broadcast_Q_Lambda(Q, Lambda)
+            print(f"[Rank {rank}] After accumulating domain {domain} | Q shape: {Q.shape if Q is not None else None} | Orthogonality error: {check_orthogonality(Q) if Q is not None else 'N/A'}")
             xm.mark_step()
 
         return Q, Lambda

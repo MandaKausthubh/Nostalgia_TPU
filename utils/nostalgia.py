@@ -120,13 +120,13 @@ class NostalgiaOptimizer(Optimizer):
                 print("[NostalgiaOptimizer] WARNING: NaN/Inf detected in gradients, skipping projection")
                 return self.base_optimizer.step(closure)
 
-            print("Q analysis befre step:")
-            print("Q finite:", torch.isfinite(self.nostalgia_Q).all())
-            print("Q max abs:", self.nostalgia_Q.abs().max())
-            print("Q orth err:", ((self.nostalgia_Q.T @ self.nostalgia_Q) - torch.eye(
-                self.nostalgia_Q.shape[1],
-                device=self.nostalgia_Q.device
-            )).abs().max())
+            # print("Q analysis befre step:")
+            # print("Q finite:", torch.isfinite(self.nostalgia_Q).all())
+            # print("Q max abs:", self.nostalgia_Q.abs().max())
+            # print("Q orth err:", ((self.nostalgia_Q.T @ self.nostalgia_Q) - torch.eye(
+            #     self.nostalgia_Q.shape[1],
+            #     device=self.nostalgia_Q.device
+            # )).abs().max())
 
             # Q^T g
             coeffs = self.nostalgia_Q.T @ g
