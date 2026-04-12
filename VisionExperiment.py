@@ -13,6 +13,8 @@ from dataclasses import dataclass, asdict
 from tqdm.notebook import tqdm
 from pytorch_adapt.datasets import DomainNet
 
+import math
+
 from utils.accumulate import *
 from utils.hessians import *
 from utils.logging import WandbLogger
@@ -182,45 +184,85 @@ class NostalgiaExperiment:
         xm.mark_step()
         return Q, Lambda
 
-    def update_Q_Lambda_for_all_past_domains(
-        self, past_domains, rank
-    ):
-        Q_memory, Lambda_memory = None, None
-        k = self.config.hessian_eigenspace_dim
-        
-        for i, domain in enumerate(past_domains):
-            xm.master_print(f"[Rank {rank}] Accumulating for domain {domain}")
-            Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(domain, rank)
-            if Q_memory is None:
-                Q_memory = Q_new
-                Lambda_memory = Lambda_new
-            else:
-                t = i+1
-                alpha, beta = (t-1)/t, 1.0/t
-                sqrt_old = torch.sqrt(Lambda_memory.clamp_min(0))
-                sqrt_new = torch.sqrt(Lambda_new.clamp_min(0))
+def update_Q_Lambda_for_all_past_domains(
+    self,
+    past_domains,
+    rank,
+):
+    """
+    Stable across-domain Hessian memory accumulation.
 
-                F_old = (math.sqrt(alpha) * Q_memory * sqrt_old.unsqueeze(0))
-                F_new = (math.sqrt(beta) * Q_new * sqrt_new.unsqueeze(0))
+    Computes running average:
+        H_bar_t = ((t-1)/t) H_bar_{t-1} + (1/t) H_t
 
-                F_global = torch.cat([F_old, F_new], dim=1)
-                Q_memory, Lambda_memory = recover_eigenspace_from_factor(
-                    F_global=F_global, k=k
-                )
-            xm.mark_step()
+    using weighted PSD factor merge.
+    """
 
-            if rank == 0:
-                err = check_orthogonality(Q_memory)
-                xm.master_print(
-                    f"[MASTER] After domain {domain}"
-                    f"Q shape: {Q_memory.shape}"
-                    f"Lambda shape: {Lambda_memory.shape}"
-                    f"Orthogonality error: {err}"
-                )
+    Q_memory = None
+    Lambda_memory = None
 
-        return Q_memory, Lambda_memory
+    k = self.config.hessian_eigenspace_dim
 
-                
+    for i, domain in enumerate(past_domains):
+
+        xm.master_print(
+            f"[Rank {rank}] Processing domain {domain}"
+        )
+        Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(
+            domain,
+            rank,
+        )
+        if Q_memory is None:
+            Q_memory = Q_new
+            Lambda_memory = Lambda_new
+
+        else:
+            t = i + 1
+
+            alpha = (t - 1) / t
+            beta = 1.0 / t
+            sqrt_old = torch.sqrt(
+                Lambda_memory.clamp_min(0)
+            )
+            sqrt_new = torch.sqrt(
+                Lambda_new.clamp_min(0)
+            )
+
+            F_old = (
+                math.sqrt(alpha)
+                * Q_memory
+                * sqrt_old.unsqueeze(0)
+            )
+
+            F_new = (
+                math.sqrt(beta)
+                * Q_new
+                * sqrt_new.unsqueeze(0)
+            )
+            F_global = torch.cat(
+                [F_old, F_new],
+                dim=1,
+            )
+
+            Q_memory, Lambda_memory = recover_eigenspace_from_factor(
+                F_global=F_global,
+                k=k,
+            )
+
+        xm.mark_step()
+
+        if rank == 0:
+            err = check_orthogonality(Q_memory)
+
+            xm.master_print(
+                f"[MASTER] After domain {domain}\n"
+                f"Q shape: {Q_memory.shape}\n"
+                f"Lambda shape: {Lambda_memory.shape}\n"
+                f"Orthogonality error: {err}"
+            )
+
+    return Q_memory, Lambda_memory
+
 
 
 
