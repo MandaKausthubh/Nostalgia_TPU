@@ -161,8 +161,8 @@ class NostalgiaOptimizer(Optimizer):
 
             self._unflatten_to_grads(g_projected)
 
-            print("grad finite:", torch.isfinite(g_projected).all())
-            print("grad norm:", g_projected.norm())
+            # print("grad finite:", torch.isfinite(g_projected).all())
+            # print("grad norm:", g_projected.norm())
 
             if self.writter is not None:
                 grad_norm = torch.norm(g)

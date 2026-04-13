@@ -155,12 +155,13 @@ class NostalgiaExperiment:
         F_local = torch.cat(factor_blocks, dim=1)
         F_local = F_local / math.sqrt(len(factor_blocks))
         G_local = F_local.T @ F_local
-        G_global = xm.all_reduce(xm.REDUCE_SUM, G_local)
+        G_global = xm.all_reduce(xm.REDUCE_SUM, G_local)/self.config.world_size
         xm.mark_step()
 
         eigvals, V = torch.linalg.eigh(G_global)
         idx = torch.argsort(eigvals, descending=True)
         eigvals = eigvals[idx]
+        V = V[:, idx]
 
         eps = 1e-9
         valid = eigvals > eps
@@ -169,6 +170,7 @@ class NostalgiaExperiment:
 
         if eigvals.numel() == 0:
             xm.master_print("[WARNING] No valid eigenvalues found, falling back to Q_old")
+            raise RuntimeError("No valid eigenvalues found")
 
         k_eff = min(k, eigvals.shape[0])
         eigvals = eigvals[:k_eff]
@@ -601,6 +603,9 @@ class NostalgiaExperiment:
 
                 # Full recomputation
             Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
+
+            assert Q_curr is not None and Lambda_curr is not None, "Q/Lambda computation failed"
+
             qtq = Q_curr.T @ Q_curr
             eye = torch.eye(qtq.shape[0], device=qtq.device, dtype=qtq.dtype)
 
