@@ -119,7 +119,7 @@ class ContinualLearnerViT(nn.Module):
             target_modules=lora_modules if lora_modules is not None else ["query", "value", "key"],
             lora_dropout=lora_dropout, bias="none"
         )
-        self.backbone = ViTClassifier().to(device)
+        self.backbone : ViTClassifier = ViTClassifier().to(device)
         self.rep_dim  = 768
         self.optimizer_type = optimizer_type
 

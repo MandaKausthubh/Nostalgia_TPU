@@ -375,3 +375,82 @@ def update_Q_Lambda_for_all_past_domains(
 
     return Q_memory, Lambda_memory
 
+
+
+def recover_eigenspace_from_factor(
+    F_global: torch.Tensor,
+    k: int,
+    eps: float = 1e-8,
+):
+    """
+    Recover low-rank eigenspace from PSD factor matrix.
+
+    Given:
+        F_global ∈ R^{n × m}
+
+    Computes eigenspace of:
+        H ≈ F F^T
+
+    using Gram trick:
+        G = F^T F
+
+    Returns:
+        Q ∈ R^{n × k_eff}
+        Lambda ∈ R^{k_eff}
+    """
+
+    # -------------------------------------
+    # small Gram matrix
+    # -------------------------------------
+    G = F_global.T @ F_global
+
+    # force symmetry
+    G = 0.5 * (G + G.T)
+
+    # -------------------------------------
+    # eigendecompose Gram
+    # -------------------------------------
+    eigvals, V = torch.linalg.eigh(G)
+
+    idx = torch.argsort(eigvals, descending=True)
+
+    eigvals = eigvals[idx]
+    V = V[:, idx]
+
+    # -------------------------------------
+    # remove numerical junk
+    # -------------------------------------
+    valid = eigvals > eps
+
+    eigvals = eigvals[valid]
+    V = V[:, valid]
+
+    if eigvals.numel() == 0:
+        raise RuntimeError(
+            "No valid eigenvalues found in factor recovery."
+        )
+
+    k_eff = min(k, eigvals.shape[0])
+
+    eigvals = eigvals[:k_eff]
+    V = V[:, :k_eff]
+
+    # -------------------------------------
+    # recover left singular vectors
+    # Q = F V Σ^{-1}
+    # -------------------------------------
+    singular_vals = torch.sqrt(
+        eigvals.clamp_min(eps)
+    )
+
+    Q = F_global @ V
+    Q = Q / singular_vals.unsqueeze(0)
+
+    # -------------------------------------
+    # mandatory orthonormal cleanup
+    # -------------------------------------
+    Q, _ = torch.linalg.qr(Q, mode="reduced")
+
+    Lambda = eigvals
+
+    return Q, Lambda

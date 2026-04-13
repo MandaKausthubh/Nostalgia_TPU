@@ -125,12 +125,15 @@ class NostalgiaExperiment:
         self, domain, rank
     ):
         self.prepare_dataloaders_for_domain(domain, rank)
-        Q, Lambda = None, None
         factor_blocks = []
+        k = self.config.hessian_eigenspace_dim
 
         xm.master_print(f"[Rank {rank}] world_size = {xr.world_size()}")
         xm.master_print(f"[Rank {rank}] device = {self.device}")
         xm.master_print(f"\n\n=========== Computing Q Lambda for {domain} =================")
+
+        assert self.current_train_loader is not None, "Train loader not prepared"
+        assert self.current_train_sampler is not None, "Train sampler not prepared"
 
         for epoch in range(self.config.iterations_of_accumulation):
             xm.master_print(f"[Rank {rank}] Epoch Starting: {epoch}")
@@ -148,13 +151,9 @@ class NostalgiaExperiment:
 
             factor_blocks.append(F_epoch)
             xm.mark_step()
-        
+
         F_local = torch.cat(factor_blocks, dim=1)
         F_local = F_local / math.sqrt(len(factor_blocks))
-
-        if rank == 0:
-            xm.master_print(f"[MASTER] | F_local shape: {F_local.shape} | F_global shape: {F_global.shape}")
-            
         G_local = F_local.T @ F_local
         G_global = xm.all_reduce(xm.REDUCE_SUM, G_local)
         xm.mark_step()
@@ -166,10 +165,11 @@ class NostalgiaExperiment:
         eps = 1e-9
         valid = eigvals > eps
         eigvals = eigvals[valid]
-        
+        V = V[:, valid]
+
         if eigvals.numel() == 0:
             xm.master_print("[WARNING] No valid eigenvalues found, falling back to Q_old")
-        
+
         k_eff = min(k, eigvals.shape[0])
         eigvals = eigvals[:k_eff]
         V = V[:, :k_eff]
@@ -177,91 +177,95 @@ class NostalgiaExperiment:
         singular_vals = torch.sqrt(eigvals)
         Q = F_local @ V
         Q = Q / singular_vals.unsqueeze(0)
-        
+
         Q, _ = torch.linalg.qr(Q, mode="reduced")
         Lambda = eigvals
 
         xm.mark_step()
+        if rank == 0:
+                qtq = Q.T @ Q
+                err = (
+                    qtq
+                    - torch.eye(
+                        qtq.shape[0],
+                        device=qtq.device,
+                        dtype=qtq.dtype,
+                    )
+                ).abs().max()
+
+                xm.master_print(
+                    f"[MASTER] FINAL RESULTS\n"
+                    f"Q shape: {Q.shape}\n"
+                    f"Lambda shape: {Lambda.shape}\n"
+                    f"Max eigenvalue: {Lambda.max().item():.6e}\n"
+                    f"Orthogonality error: {err.item():.6e}"
+                )
         return Q, Lambda
 
-def update_Q_Lambda_for_all_past_domains(
-    self,
-    past_domains,
-    rank,
-):
-    """
-    Stable across-domain Hessian memory accumulation.
 
-    Computes running average:
-        H_bar_t = ((t-1)/t) H_bar_{t-1} + (1/t) H_t
+    def update_Q_Lambda_for_all_past_domains(
+        self,
+        past_domains,
+        rank,
+    ):
+        """
+        Stable across-domain Hessian memory accumulation.
 
-    using weighted PSD factor merge.
-    """
+        Computes running average:
+            H_bar_t = ((t-1)/t) H_bar_{t-1} + (1/t) H_t
 
-    Q_memory = None
-    Lambda_memory = None
+        using weighted PSD factor merge.
+        """
 
-    k = self.config.hessian_eigenspace_dim
+        Q_memory = None
+        Lambda_memory = None
 
-    for i, domain in enumerate(past_domains):
+        k = self.config.hessian_eigenspace_dim
 
-        xm.master_print(
-            f"[Rank {rank}] Processing domain {domain}"
-        )
-        Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(
-            domain,
-            rank,
-        )
-        if Q_memory is None:
-            Q_memory = Q_new
-            Lambda_memory = Lambda_new
-
-        else:
-            t = i + 1
-
-            alpha = (t - 1) / t
-            beta = 1.0 / t
-            sqrt_old = torch.sqrt(
-                Lambda_memory.clamp_min(0)
-            )
-            sqrt_new = torch.sqrt(
-                Lambda_new.clamp_min(0)
-            )
-
-            F_old = (
-                math.sqrt(alpha)
-                * Q_memory
-                * sqrt_old.unsqueeze(0)
-            )
-
-            F_new = (
-                math.sqrt(beta)
-                * Q_new
-                * sqrt_new.unsqueeze(0)
-            )
-            F_global = torch.cat(
-                [F_old, F_new],
-                dim=1,
-            )
-
-            Q_memory, Lambda_memory = recover_eigenspace_from_factor(
-                F_global=F_global,
-                k=k,
-            )
-
-        xm.mark_step()
-
-        if rank == 0:
-            err = check_orthogonality(Q_memory)
+        for i, domain in enumerate(past_domains):
 
             xm.master_print(
-                f"[MASTER] After domain {domain}\n"
-                f"Q shape: {Q_memory.shape}\n"
-                f"Lambda shape: {Lambda_memory.shape}\n"
-                f"Orthogonality error: {err}"
+                f"[Rank {rank}] Processing domain {domain}"
             )
 
-    return Q_memory, Lambda_memory
+            Q_new, Lambda_new = self.update_Q_Lambda_for_single_domain(
+                domain, rank
+            )
+
+            if Q_memory is None or Lambda_memory is None:
+                Q_memory = Q_new
+                Lambda_memory = Lambda_new
+            else:
+                t = i + 1
+
+                alpha = (t - 1) / t
+                beta = 1.0 / t
+                sqrt_old = torch.sqrt(Lambda_memory.clamp_min(0))
+                sqrt_new = torch.sqrt(Lambda_new.clamp_min(0))
+
+                F_old = (math.sqrt(alpha) * Q_memory * sqrt_old.unsqueeze(0))
+
+                F_new = (math.sqrt(beta) * Q_new * sqrt_new.unsqueeze(0))
+                F_global = torch.cat( [F_old, F_new], dim=1)
+
+                Q_memory, Lambda_memory = recover_eigenspace_from_factor(
+                    F_global=F_global,
+                    k=k,
+                )
+
+            xm.mark_step()
+
+            if rank == 0:
+                err = check_orthogonality(Q_memory)
+
+                xm.master_print(
+                    f"[MASTER] After domain {domain}\n"
+                    f"Q shape: {Q_memory.shape}\n"
+                    f"Lambda shape: {Lambda_memory.shape}\n"
+                    f"Orthogonality error: {err}"
+                )
+
+        return Q_memory, Lambda_memory
 
 
 
@@ -354,6 +358,9 @@ def update_Q_Lambda_for_all_past_domains(
         results = {}
         for dom in self.finished_domains:
             self.prepare_dataloaders_for_domain(dom, rank) # you'll need to implement or cache
+
+            assert self.current_test_loader is not None, f"Test loader not prepared for domain {dom}"
+
             total_loss, total_acc, count = 0., 0., 0
             self.model.set_active_task(dom)
             for batch in self.current_test_loader:  # or your parallel loader
@@ -394,6 +401,9 @@ def update_Q_Lambda_for_all_past_domains(
 
     def train_taskhead(self, domain, epochs, rank):
         self.prepare_dataloaders_for_domain(domain, rank)
+
+        assert self.current_train_loader is not None, "Train loader not prepared for task head training"
+
         self.model.set_active_task(domain)
         criterion = self.model.criterion
         self.model.task_head_list[domain].train()
