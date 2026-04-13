@@ -28,7 +28,9 @@ python main.py \
 
 import argparse
 import functools
+import os
 
+from transformers import AutoConfig, AutoModel, AutoProcessor
 import torch_xla.distributed.xla_multiprocessing as xmp
 
 from VisionExperiment import NostalgiaExperiment
@@ -292,6 +294,33 @@ def args_to_config(args: argparse.Namespace) -> NostalgiaConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Model prefetch  (called ONCE on the main process, before xmp.spawn)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MODEL_ID = "google/vit-base-patch32-224-in21k"
+
+def prefetch_model(hf_home: str) -> None:
+    """
+    Download the ViT checkpoint to the local HF cache exactly once, on the
+    main process, before xmp.spawn launches the 8 TPU worker processes.
+
+    Without this, every worker calls AutoModel.from_pretrained() as soon as
+    it spawns, producing up to 24 simultaneous requests (config + processor +
+    weights, times 8 workers) against HuggingFace Hub.  Kaggle free-tier VMs
+    throttle that traffic, causing the download to stall indefinitely.
+
+    Workers inherit the HF_HOME env-var set in main() and therefore find the
+    weights already on disk — no network calls needed inside the workers.
+    """
+    os.makedirs(hf_home, exist_ok=True)
+    print(f"[prefetch] Downloading '{_MODEL_ID}' to '{hf_home}' ...")
+    AutoConfig.from_pretrained(_MODEL_ID)
+    AutoProcessor.from_pretrained(_MODEL_ID, use_fast=True)
+    AutoModel.from_pretrained(_MODEL_ID)
+    print(f"[prefetch] Model cached — spawning TPU workers.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Worker function (called once per TPU core by xmp.spawn)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -313,6 +342,14 @@ def main() -> None:
     for field, value in vars(config).items():
         print(f"  {field:<35} {value}")
     print("===================================\n")
+
+    # ── Model prefetch ────────────────────────────────────────────────────
+    # Point HuggingFace to a writable Kaggle working directory and download
+    # the model ONCE here, before spawning the 8 TPU worker processes.
+    # Workers inherit HF_HOME from the environment and load from disk cache.
+    hf_home = "/kaggle/working/.cache/hf"
+    os.environ["HF_HOME"] = hf_home
+    prefetch_model(hf_home)
 
     # Pass config through xmp.spawn via functools.partial so every spawned
     # process receives an identical config without re-parsing CLI args.
