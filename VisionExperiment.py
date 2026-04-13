@@ -54,14 +54,14 @@ class NostalgiaExperiment:
 
         self.model = ContinualLearnerViT(
             lr=self.config.lr,
-            downstream_lr=self.config.downstream_lr, 
+            downstream_lr=self.config.downstream_lr,
             lora_r=self.config.lora_r,
             lora_alpha=self.config.lora_alpha,
-            lora_dropout=0.1,
+            lora_dropout=self.config.lora_dropout,   # BUG FIX: was hardcoded 0.1
             use_peft=True,
-            lora_modules = None,
+            lora_modules=None,
             device=self.device,
-            optimizer_type="adamw"
+            optimizer_type=self.config.base_optimizer,  # BUG FIX: was hardcoded "adamw"
         ).to(self.device)
 
         # Create datasets once — shared across epochs/domains
@@ -114,11 +114,12 @@ class NostalgiaExperiment:
 
     def transform(self, image):
         image = self.augment(image)
-        pixel_values = self.model.backbone.processor(
+        # BUG FIX: backbone.processor disappears after get_peft_model() wraps the backbone;
+        # use the cached _processor reference set before PEFT is applied.
+        pixel_values = self.model._processor(
             images=image,
             return_tensors="pt"
         )["pixel_values"].squeeze(0)
-
         return pixel_values
 
     def update_Q_Lambda_for_single_domain(
@@ -394,6 +395,8 @@ class NostalgiaExperiment:
             }
 
         self.model.train()
+        if not results:  # BUG FIX: guard against zero-division when no domains finished
+            return {}, 0.0, 0.0
         avg_acc = sum(r['Test_Accuracy'] for r in results.values()) / len(results)
         avg_loss = sum(r['Test_Loss'] for r in results.values()) / len(results)
         xm.master_print(f"After domain {self.finished_domains[-1]} → Avg seen acc: {avg_acc:.2f}%")
@@ -450,26 +453,29 @@ class NostalgiaExperiment:
             self.prepare_dataloaders_for_domain(domain, rank)
 
         global_step = 1
-        self.model.set_Q(Q_curr, scaling=None)
-
-        optimizer = self.model.configure_optimizers(
-            writter = self.writer,
-            iteration = global_step,   # REQUIRED FOR LOGGING
-        )
-
         domain_list = []
 
         for domain in self.domains:
             self.prepare_dataloaders_for_domain(domain, rank)
             criterion = self.model.criterion
 
+            # BUG FIX: activate task BEFORE building the optimizer so that
+            # head params have requires_grad=True and are included in head_params.
             self.model.set_active_task(domain)
 
             xm.master_print(f"\n====== Starting training on domain: {domain} =======")
             domain_list.append(domain)
 
+            # BUG FIX: rebuild optimizer each domain so the newly-active head
+            # params are tracked; also apply Q before constructing so the
+            # NostalgiaOptimizer receives the correct subspace from the start.
+            self.model.set_Q(Q_curr, scaling=None)
+            optimizer = self.model.configure_optimizers(
+                writter=self.writer,
+                iteration=global_step,
+            )
             if Q_curr is not None:
-                optimizer.set_Q(Q_curr, None)   # Ignoring scaling for now
+                optimizer.set_Q(Q_curr, None)
 
             self.finished_domains.append(domain)
             self.train_taskhead(domain, self.config.head_warmup_epochs, rank)
@@ -603,6 +609,10 @@ class NostalgiaExperiment:
 
                 # Full recomputation
             Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
+            # BUG FIX: each rank computes Q/Lambda from its own data shard;
+            # broadcast from rank 0 so every core uses the same subspace.
+            Q_curr, Lambda_curr = broadcast_Q_Lambda(Q_curr, Lambda_curr, src=0)
+            xm.mark_step()
 
             assert Q_curr is not None and Lambda_curr is not None, "Q/Lambda computation failed"
 

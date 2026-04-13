@@ -30,9 +30,9 @@ class NostalgiaConfig:
     # Backbone: small LR for fine-tuning pre-trained ViT through LoRA.
     # 3e-5 is proven safe for ViT-Base with AdamW; 1e-5 is too conservative
     # and causes the 'accuracy decreasing' symptom seen in the graphs.
-    lr: float = 3e-5
+    lr: float = 1e-4
     # Task head: larger LR, trained from scratch on top of frozen features.
-    downstream_lr: float = 3e-4
+    downstream_lr: float = 5e-4
 
     # ── Optimiser ────────────────────────────────────────────────────────
     # AdamW with decoupled weight decay is the standard for ViT fine-tuning.
@@ -47,7 +47,7 @@ class NostalgiaConfig:
     # Prevents the backbone from being corrupted by a random linear head.
     head_warmup_epochs: int = 3
 
-    device: str = 'mps'
+    device: str = 'tpu'
     validate_after_steps: int = 10
     log_deltas: bool = True
 
@@ -74,17 +74,25 @@ class NostalgiaConfig:
     # ── Hessian / Nostalgia ───────────────────────────────────────────────
     hessian_eigenspace_dim: int = 16
     moving_average_hessians_epochs: int = 5
-    gamma: torch.float32 = 0.9
+    gamma: float = 0.9
     iterations_of_accumulation: int = 4
     use_scaling: bool = True
 
     accumulate_mode: str = 'accumulate'  # or 'union'
     merge_tasks: str = 'union'           # or 'accumulate'
     adapt_downstream_tasks: bool = False
-    log_dir: str = f'logs/nostalgia_vision_experiment/{mode}/{lr}/{lora_r}/{hessian_eigenspace_dim}/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
+    log_dir: str = ''  # set dynamically in __post_init__
 
     use_tpu: bool = True
     world_size: int = 8
+
+    def __post_init__(self):
+        if not self.log_dir:
+            self.log_dir = (
+                f'logs/nostalgia_vision_experiment/{self.mode}/{self.lr}'
+                f'/{self.lora_r}/{self.hessian_eigenspace_dim}'
+                f'/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
+            )
 
 
 
@@ -120,6 +128,7 @@ class ContinualLearnerViT(nn.Module):
             lora_dropout=lora_dropout, bias="none"
         )
         self.backbone : ViTClassifier = ViTClassifier().to(device)
+        self._processor = self.backbone.processor  # cache before PEFT re-wraps backbone
         self.rep_dim  = 768
         self.optimizer_type = optimizer_type
 
