@@ -622,6 +622,10 @@ class NostalgiaExperiment:
             # broadcast from rank 0 so every core uses the same subspace.
             Q_curr, Lambda_curr = broadcast_Q_Lambda(Q_curr, Lambda_curr, src=0)
             Q_curr, _ = torch.linalg.qr(Q_curr, mode="reduced")
+
+            Q_curr = Q_curr.detach().clone().contiguous()
+            Lambda_curr = Lambda_curr.detach().clone().contiguous()
+
             xm.mark_step()
 
             assert Q_curr is not None and Lambda_curr is not None, "Q/Lambda computation failed"
