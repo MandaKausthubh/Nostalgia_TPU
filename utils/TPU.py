@@ -31,7 +31,7 @@ def broadcast_Q_Lambda(
     All ranks MUST call this function. This relies on identical computational 
     graphs across all ranks to maintain SPMD compliance for PyTorch/XLA.
     """
-    if xm.xrt_world_size() <= 1:
+    if xr.world_size() <= 1:
         return Q, Lambda
 
     if Q is None or Lambda is None:
@@ -39,7 +39,7 @@ def broadcast_Q_Lambda(
 
     device = Q.device
     dtype = Q.dtype
-    rank = xm.get_ordinal()
+    rank = xr.global_ordinal()
 
     # SPMD safe masking: all ranks construct a mask, so the graph is exactly the same.
     # Non-source ranks multiply their Q by 0, source rank multiplies by 1.
