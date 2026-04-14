@@ -475,6 +475,15 @@ class NostalgiaExperiment:
                 iteration=global_step,
             )
             if Q_curr is not None:
+                print(
+                    f"Q stats before setting in optimizer for domain {domain}:"
+                    f"Q max abs: {Q_curr.abs().max().item()}",
+                    f"Q norm: {Q_curr.norm().item()}",
+                    f"Q is finite: {torch.isfinite(Q_curr).all().item()}",
+                    f"Q shape: {Q_curr.shape}",
+                    f"Q device: {Q_curr.device}",
+                    "Q dtype: ", Q_curr.dtype,
+                )
                 optimizer.set_Q(Q_curr, None)
 
             self.finished_domains.append(domain)
