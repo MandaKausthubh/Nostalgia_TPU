@@ -44,6 +44,8 @@ def broadcast_Q_Lambda(
     if world_size == 1:
         return Q, Lambda
 
+    global_type = Q.dtype
+
     rank = xr.global_ordinal()
     device = xm.xla_device()
 
@@ -58,8 +60,8 @@ def broadcast_Q_Lambda(
         N, k = 0, 0
 
     # Exchange N and k via all_reduce (only src contributes the real values)
-    N_t = torch.tensor(float(N), device=device)
-    k_t = torch.tensor(float(k), device=device)
+    N_t = torch.tensor(float(N), device=device, dtype=global_type)
+    k_t = torch.tensor(float(k), device=device, dtype=global_type)
     N_t = xm.all_reduce(xm.REDUCE_SUM, N_t)
     k_t = xm.all_reduce(xm.REDUCE_SUM, k_t)
     xm.mark_step()
@@ -75,9 +77,9 @@ def broadcast_Q_Lambda(
     # Step 2 – broadcast Q                                                 #
     # ------------------------------------------------------------------ #
     if rank == src:
-        Q_bcast = Q.to(device=device, dtype=torch.float32)
+        Q_bcast = Q.to(device=device, dtype=global_type)
     else:
-        Q_bcast = torch.zeros(N_global, k_global, device=device, dtype=torch.float32)
+        Q_bcast = torch.zeros(N_global, k_global, device=device, dtype=global_type)
 
     Q_bcast = xm.all_reduce(xm.REDUCE_SUM, Q_bcast)
     xm.mark_step()
@@ -86,9 +88,9 @@ def broadcast_Q_Lambda(
     # Step 3 – broadcast Lambda                                            #
     # ------------------------------------------------------------------ #
     if rank == src:
-        L_bcast = Lambda.to(device=device, dtype=torch.float32)
+        L_bcast = Lambda.to(device=device, dtype=global_type)
     else:
-        L_bcast = torch.zeros(k_global, device=device, dtype=torch.float32)
+        L_bcast = torch.zeros(k_global, device=device, dtype=global_type)
 
     L_bcast = xm.all_reduce(xm.REDUCE_SUM, L_bcast)
     xm.mark_step()
