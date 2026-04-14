@@ -476,13 +476,14 @@ class NostalgiaExperiment:
             )
             if Q_curr is not None:
                 print(
-                    f"Q stats before setting in optimizer for domain {domain}:"
-                    f"Q max abs: {Q_curr.abs().max().item()}",
-                    f"Q norm: {Q_curr.norm().item()}",
-                    f"Q is finite: {torch.isfinite(Q_curr).all().item()}",
-                    f"Q shape: {Q_curr.shape}",
-                    f"Q device: {Q_curr.device}",
-                    "Q dtype: ", Q_curr.dtype,
+                    f"Q stats before setting in optimizer for domain {domain}:\n"
+                    f"\tQ max abs: {Q_curr.abs().max().item()}\n"
+                    f"\tQ norm: {Q_curr.norm().item()}\n"
+                    f"\tQ is finite: {torch.isfinite(Q_curr).all().item()}\n"
+                    f"\tQ max ortho error: {(Q_curr.T @ Q_curr - torch.eye(Q_curr.shape[1], device=Q_curr.device)).abs().max().item()}\n"
+                    f"\tQ shape: {Q_curr.shape}\n"
+                    f"\tQ device: {Q_curr.device}\n"
+                    f"\tQ dtype: {Q_curr.dtype}\n"
                 )
                 optimizer.set_Q(Q_curr, None)
 
