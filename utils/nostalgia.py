@@ -128,6 +128,22 @@ class NostalgiaOptimizer(Optimizer):
             #     device=self.nostalgia_Q.device
             # )).abs().max())
 
+            print(
+                "grad stats:",
+                g.abs().max().item(),
+                g.norm().item(),
+                torch.isfinite(g).all().item()
+            )
+
+            print(
+                "Q stats:",
+                self.nostalgia_Q.abs().max().item(),
+                torch.isfinite(self.nostalgia_Q).all().item()
+            )
+
+            print(self.nostalgia_Q.device)
+            print(g.device)
+
             # Q^T g
             coeffs = self.nostalgia_Q.T @ g
 
