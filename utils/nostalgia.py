@@ -63,6 +63,12 @@ class NostalgiaOptimizer(Optimizer):
             self.scaling = None
             return
 
+        print(
+            "[set_Q before copy]",
+            torch.isfinite(Q).all().item(),
+            Q.abs().max().item()
+        )
+
         if Q.shape[0] != self.num_params:
             raise ValueError(
                 f"Q has {Q.shape[0]} rows, expected {self.num_params} "
@@ -70,6 +76,12 @@ class NostalgiaOptimizer(Optimizer):
             )
         self.nostalgia_Q = Q.to(self.device, self.dtype)
         self.scaling = scaling.to(self.device, self.dtype) if scaling is not None else None
+
+        print(
+            "[set_Q after copy]",
+            torch.isfinite(self.nostalgia_Q).all().item(),
+            self.nostalgia_Q.abs().max().item()
+        )
 
     # ------------------------------------------------------------------
     def _flatten_grads(self) -> torch.Tensor:
