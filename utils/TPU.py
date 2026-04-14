@@ -28,71 +28,27 @@ def broadcast_Q_Lambda(
     """
     Broadcast Q and Lambda tensors from source rank (src) to all other ranks.
 
-    All ranks MUST call this function.  The source rank (rank 0 by default)
-    holds valid tensors; every other rank contributes zeros that get summed
-    away by all_reduce(SUM), leaving only the src values.
-
-    Args:
-        Q:      Eigenvector matrix [N, k] on src rank; can be None on others.
-        Lambda: Eigenvalue tensor   [k]   on src rank; can be None on others.
-        src:    Source rank (default 0).
-
-    Returns:
-        (Q, Lambda) – identical tensors on every rank.
+    All ranks MUST call this function. This relies on identical computational 
+    graphs across all ranks to maintain SPMD compliance for PyTorch/XLA.
     """
-    world_size = xr.world_size()
-    if world_size == 1:
+    if xm.xrt_world_size() <= 1:
         return Q, Lambda
 
-    global_type = Q.dtype
-
-    rank = xr.global_ordinal()
-    device = xm.xla_device()
-
-    # ------------------------------------------------------------------ #
-    # Step 1 – broadcast shape metadata using scalar all_reduces           #
-    # ------------------------------------------------------------------ #
-    if rank == src:
-        assert Q is not None and Lambda is not None, \
-            "Source rank must have valid Q and Lambda tensors"
-        N, k = Q.shape
-    else:
-        N, k = 0, 0
-
-    # Exchange N and k via all_reduce (only src contributes the real values)
-    N_t = torch.tensor(float(N), device=device, dtype=global_type)
-    k_t = torch.tensor(float(k), device=device, dtype=global_type)
-    N_t = xm.all_reduce(xm.REDUCE_SUM, N_t)
-    k_t = xm.all_reduce(xm.REDUCE_SUM, k_t)
-    xm.mark_step()
-
-    N_global = int(N_t.item())
-    k_global = int(k_t.item())
-
-    if N_global == 0 or k_global == 0:
-        # Nothing to broadcast (e.g. first task, Q/Lambda are None everywhere)
+    if Q is None or Lambda is None:
         return Q, Lambda
 
-    # ------------------------------------------------------------------ #
-    # Step 2 – broadcast Q                                                 #
-    # ------------------------------------------------------------------ #
-    if rank == src:
-        Q_bcast = Q.to(device=device, dtype=global_type)
-    else:
-        Q_bcast = torch.zeros(N_global, k_global, device=device, dtype=global_type)
+    device = Q.device
+    dtype = Q.dtype
+    rank = xm.get_ordinal()
 
-    Q_bcast = xm.all_reduce(xm.REDUCE_SUM, Q_bcast)
-    xm.mark_step()
+    # SPMD safe masking: all ranks construct a mask, so the graph is exactly the same.
+    # Non-source ranks multiply their Q by 0, source rank multiplies by 1.
+    mask = torch.tensor(1.0 if rank == src else 0.0, device=device, dtype=dtype)
 
-    # ------------------------------------------------------------------ #
-    # Step 3 – broadcast Lambda                                            #
-    # ------------------------------------------------------------------ #
-    if rank == src:
-        L_bcast = Lambda.to(device=device, dtype=global_type)
-    else:
-        L_bcast = torch.zeros(k_global, device=device, dtype=global_type)
+    Q_bcast = xm.all_reduce(xm.REDUCE_SUM, Q * mask)
+    L_bcast = xm.all_reduce(xm.REDUCE_SUM, Lambda * mask)
 
-    L_bcast = xm.all_reduce(xm.REDUCE_SUM, L_bcast)
+    # Sync block to ensure propagation completes successfully
     xm.mark_step()
 
     return Q_bcast, L_bcast

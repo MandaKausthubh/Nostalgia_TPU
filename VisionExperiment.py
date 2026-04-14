@@ -475,16 +475,17 @@ class NostalgiaExperiment:
                 iteration=global_step,
             )
             if Q_curr is not None:
-                print(
-                    f"Q stats before setting in optimizer for domain {domain}:\n"
-                    f"\tQ max abs: {Q_curr.abs().max().item()}\n"
-                    f"\tQ norm: {Q_curr.norm().item()}\n"
-                    f"\tQ is finite: {torch.isfinite(Q_curr).all().item()}\n"
-                    f"\tQ max ortho error: {(Q_curr.T @ Q_curr - torch.eye(Q_curr.shape[1], device=Q_curr.device)).abs().max().item()}\n"
-                    f"\tQ shape: {Q_curr.shape}\n"
-                    f"\tQ device: {Q_curr.device}\n"
-                    f"\tQ dtype: {Q_curr.dtype}\n"
-                )
+                if xm.is_master_ordinal():
+                    print(
+                        f"Q stats before setting in optimizer for domain {domain}:\n"
+                        f"\tQ max abs: {Q_curr.abs().max().item()}\n"
+                        f"\tQ norm: {Q_curr.norm().item()}\n"
+                        f"\tQ is finite: {torch.isfinite(Q_curr).all().item()}\n"
+                        f"\tQ max ortho error: {(Q_curr.T @ Q_curr - torch.eye(Q_curr.shape[1], device=Q_curr.device)).abs().max().item()}\n"
+                        f"\tQ shape: {Q_curr.shape}\n"
+                        f"\tQ device: {Q_curr.device}\n"
+                        f"\tQ dtype: {Q_curr.dtype}\n"
+                    )
                 optimizer.set_Q(Q_curr, None)
 
             self.finished_domains.append(domain)
@@ -615,13 +616,16 @@ class NostalgiaExperiment:
                                 self.writer.add_scalars(eval_domain, metrics, global_step)
                         self.model.set_active_task(domain)   # Evaluation possible changes the head, so setting it back to the current task
 
-            # if xm.is_master_ordinal() or True:
-
-                # Full recomputation
+            # ── Recompute Q/Lambda once, AFTER all epochs for this domain ──
+            # This runs outside the epoch loop so Q is computed only once per
+            # domain, then broadcast from rank 0 to every TPU core so all
+            # ranks use the exact same subspace for the next domain.
             Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
-            # BUG FIX: each rank computes Q/Lambda from its own data shard;
-            # broadcast from rank 0 so every core uses the same subspace.
+
+            # Broadcast from rank 0 → all ranks so every core has the same Q.
             Q_curr, Lambda_curr = broadcast_Q_Lambda(Q_curr, Lambda_curr, src=0)
+
+            # Re-orthogonalise after broadcast (numerical safety).
             Q_curr, _ = torch.linalg.qr(Q_curr, mode="reduced")
 
             Q_curr = Q_curr.detach().clone().contiguous()
@@ -633,25 +637,9 @@ class NostalgiaExperiment:
 
             qtq = Q_curr.T @ Q_curr
             eye = torch.eye(qtq.shape[0], device=qtq.device, dtype=qtq.dtype)
-
             orth_err = (qtq - eye).abs().max()
             xm.master_print("max orthogonality error =", orth_err.item())
 
-                # For EMA style updates
-                # Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
-                # Q_curr = (self.config.gamma * Q_new) + ((1-self.config.gamma) * Q_curr)
-                # Lamda_curr = (self.config.gamma * Lambda_new) + ((1-self.config.gamma) * Lambda_curr)
-
-                # For single merging
-                # Q_new, Lambda_new = update_Q_Lambda_for_single_domain(domain, rank)
-                # Q_curr, Lambda_curr = accumulate_hessian_eigenspace(
-                #     Q_old=Q_curr, Lambda_old = Lambda_curr,
-                #     Q_new=Q_new,  Lambda_new = Lambda_new,
-                #     t=len(self.finished_domains), k=self.config.hessian_eigenspace_dim
-                # )
-
-                # Q_curr = broadcast_tensor(Q_curr)
-                # Lambda_curr = broadcast_tensor(Lambda_curr)
             xm.master_print("Number of steps at the end of training: ", {global_step})
 
         xm.master_print("All domains completed")
