@@ -97,7 +97,7 @@ class NostalgiaExperiment:
 
         if xm.is_master_ordinal():
             self.writer = WandbLogger(
-                project='Nostalgia',
+                project='Nostalgia-Vision',
                 config=asdict(self.config)
             )
         else:
@@ -109,7 +109,7 @@ class NostalgiaExperiment:
         self.ema_accuracy: Optional[float] = None
         self.ema_beta: float = 0.9  # Higher = smoother
 
-        xm.master_print(f"Initialized on device: {self.device}, world_size={self.config.world_size}")
+        # xm.master_print(f"Initialized on device: {self.device}, world_size={self.config.world_size}")
 
 
     def transform(self, image):
@@ -181,13 +181,11 @@ class NostalgiaExperiment:
         Q = F_local @ V
         Q = Q / singular_vals.unsqueeze(0)
 
-        # CRITICAL FIX: Sync before QR to ensure Q is fully computed
         xm.mark_step()
 
         Q, _ = torch.linalg.qr(Q, mode="reduced")
         Lambda = eigvals
 
-        # CRITICAL FIX: Ensure Q/Lambda are valid and synced before returning
         Q = Q.detach().contiguous()
         Lambda = Lambda.detach().contiguous()
         xm.mark_step()
@@ -502,16 +500,11 @@ class NostalgiaExperiment:
             self.prepare_dataloaders_for_domain(domain, rank)
             criterion = self.model.criterion
 
-            # BUG FIX: activate task BEFORE building the optimizer so that
-            # head params have requires_grad=True and are included in head_params.
             self.model.set_active_task(domain)
 
             xm.master_print(f"\n====== Starting training on domain: {domain} =======")
             domain_list.append(domain)
 
-            # BUG FIX: rebuild optimizer each domain so the newly-active head
-            # params are tracked; also apply Q before constructing so the
-            # NostalgiaOptimizer receives the correct subspace from the start.
             self.model.set_Q(Q_curr, scaling=None)
             optimizer = self.model.configure_optimizers(
                 writter=self.writer,
@@ -531,6 +524,8 @@ class NostalgiaExperiment:
                 optimizer.set_Q(Q_curr, None)
 
             self.finished_domains.append(domain)
+
+            print(f"Training-Head for domain {domain} with Q from previous domains: {Q_curr is not None}")
             self.train_taskhead(domain, self.config.head_warmup_epochs, rank)
 
             # Switch backbone back to train() mode after task-head warmup
@@ -621,12 +616,12 @@ class NostalgiaExperiment:
 
                     if step % log_interval == 0:
                         # Aggregate EMA, running averages, and per-step values across all TPU cores
-                        global_ema_loss  = xm.mesh_reduce('ema_loss',  self.ema_loss,                                    sum) / self.config.world_size
-                        global_ema_acc   = xm.mesh_reduce('ema_acc',   self.ema_accuracy,                               sum) / self.config.world_size
-                        global_avg_loss  = xm.mesh_reduce('avg_loss',  epoch_loss_sum / epoch_step_count,               sum) / self.config.world_size
-                        global_avg_acc   = xm.mesh_reduce('avg_acc',   epoch_acc_sum  / epoch_step_count,               sum) / self.config.world_size
-                        global_step_loss = xm.mesh_reduce('step_loss', loss_value,                                       sum) / self.config.world_size
-                        global_step_acc  = xm.mesh_reduce('step_acc',  acc_value,                                        sum) / self.config.world_size
+                        global_ema_loss  = xm.mesh_reduce('ema_loss',  self.ema_loss,                     sum) / self.config.world_size
+                        global_ema_acc   = xm.mesh_reduce('ema_acc',   self.ema_accuracy,                 sum) / self.config.world_size
+                        global_avg_loss  = xm.mesh_reduce('avg_loss',  epoch_loss_sum / epoch_step_count, sum) / self.config.world_size
+                        global_avg_acc   = xm.mesh_reduce('avg_acc',   epoch_acc_sum  / epoch_step_count, sum) / self.config.world_size
+                        global_step_loss = xm.mesh_reduce('step_loss', loss_value,                        sum) / self.config.world_size
+                        global_step_acc  = xm.mesh_reduce('step_acc',  acc_value,                         sum) / self.config.world_size
                         global_grad_norm = xm.mesh_reduce('grad_norm', grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm, sum) / self.config.world_size
 
                         if xm.is_master_ordinal():

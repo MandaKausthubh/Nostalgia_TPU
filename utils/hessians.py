@@ -132,8 +132,8 @@ def lanczos(hvp_fn, dim, k, device):
     actual_k = k  # Track actual rank (may be less if early exit)
 
     for j in range(k):
-        if rank == 0:
-            print(f"[Lanczos iteration]: {j}/{k}")
+        # if rank == 0:
+        #     print(f"[Lanczos iteration]: {j}/{k}")
 
         # ── Step 1: bring current q_j to device ──────────────────────
         q_j = Q_cpu[:, j].to(device)
