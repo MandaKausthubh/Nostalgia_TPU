@@ -446,9 +446,6 @@ def recover_eigenspace_from_factor(
     Q = F_global @ V
     Q = Q / singular_vals.unsqueeze(0)
 
-    # CRITICAL: Sync before QR
-    xm.mark_step()
-
     # -------------------------------------
     # mandatory orthonormal cleanup
     # -------------------------------------
@@ -457,9 +454,8 @@ def recover_eigenspace_from_factor(
     Lambda = eigvals
 
     # CRITICAL: Ensure Q and Lambda are fully materialized before returning
-    Q = Q.detach().clone().contiguous()
-    Lambda = Lambda.detach().clone().contiguous()
-
+    Q = Q.detach().contiguous()
+    Lambda = Lambda.detach().contiguous()
     xm.mark_step()
 
     return Q, Lambda

@@ -188,15 +188,8 @@ class NostalgiaExperiment:
         Lambda = eigvals
 
         # CRITICAL FIX: Ensure Q/Lambda are valid and synced before returning
-        # Use explicit copy pattern for robust XLA materialization
-        Q_out = torch.zeros_like(Q)
-        Q_out.copy_(Q)
-        Q = Q_out.contiguous()
-
-        Lambda_out = torch.zeros_like(Lambda)
-        Lambda_out.copy_(Lambda)
-        Lambda = Lambda_out.contiguous()
-
+        Q = Q.detach().contiguous()
+        Lambda = Lambda.detach().contiguous()
         xm.mark_step()
 
         # Validation: check for NaN/Inf
@@ -281,21 +274,8 @@ class NostalgiaExperiment:
                 )
 
             # CRITICAL FIX: Ensure Q_memory/Lambda_memory are valid after merge
-            # Use explicit copy to avoid view issues
-            Q_temp = torch.zeros_like(Q_memory)
-            Q_temp.copy_(Q_memory)
-            Q_memory = Q_temp
-
-            Lambda_temp = torch.zeros_like(Lambda_memory)
-            Lambda_temp.copy_(Lambda_memory)
-            Lambda_memory = Lambda_temp
-
-            xm.mark_step()
-
-            # Make contiguous after copy
-            Q_memory = Q_memory.contiguous()
-            Lambda_memory = Lambda_memory.contiguous()
-
+            Q_memory = Q_memory.detach().contiguous()
+            Lambda_memory = Lambda_memory.detach().contiguous()
             xm.mark_step()
 
             # Validation: check for NaN/Inf
@@ -319,15 +299,8 @@ class NostalgiaExperiment:
 
         # CRITICAL FIX: Final validation before returning
         if Q_memory is not None and Lambda_memory is not None:
-            # Use explicit copy for robust materialization
-            Q_final = torch.zeros_like(Q_memory)
-            Q_final.copy_(Q_memory)
-            Q_memory = Q_final.contiguous()
-
-            Lambda_final = torch.zeros_like(Lambda_memory)
-            Lambda_final.copy_(Lambda_memory)
-            Lambda_memory = Lambda_final.contiguous()
-
+            Q_memory = Q_memory.detach().contiguous()
+            Lambda_memory = Lambda_memory.detach().contiguous()
             xm.mark_step()
 
             # All-rank validation
@@ -692,15 +665,9 @@ class NostalgiaExperiment:
             Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
 
             # CRITICAL FIX: Force full materialization before broadcast
-            # Use explicit copy pattern for robust XLA materialization
-            Q_pre = torch.zeros_like(Q_curr)
-            Q_pre.copy_(Q_curr)
-            Q_curr = Q_pre.contiguous()
-
-            Lambda_pre = torch.zeros_like(Lambda_curr)
-            Lambda_pre.copy_(Lambda_curr)
-            Lambda_curr = Lambda_pre.contiguous()
-
+            # Simplified: just ensure tensors are detached and contiguous
+            Q_curr = Q_curr.detach().contiguous()
+            Lambda_curr = Lambda_curr.detach().contiguous()
             xm.mark_step()
 
             # Validate Q before broadcast (only on rank 0 to avoid spam)
@@ -716,15 +683,9 @@ class NostalgiaExperiment:
             xm.master_print(f"[Rank {rank}] Starting broadcast...")
             Q_curr, Lambda_curr = broadcast_Q_Lambda(Q_curr, Lambda_curr, src=0)
 
-            # CRITICAL FIX: Materialize after broadcast using explicit copy
-            Q_post = torch.zeros_like(Q_curr)
-            Q_post.copy_(Q_curr)
-            Q_curr = Q_post.contiguous()
-
-            Lambda_post = torch.zeros_like(Lambda_curr)
-            Lambda_post.copy_(Lambda_curr)
-            Lambda_curr = Lambda_post.contiguous()
-
+            # Materialize after broadcast
+            Q_curr = Q_curr.detach().contiguous()
+            Lambda_curr = Lambda_curr.detach().contiguous()
             xm.mark_step()
 
             # Validate Q after broadcast (all ranks)
@@ -741,15 +702,9 @@ class NostalgiaExperiment:
             else:
                 xm.master_print(f"[Rank {rank}] WARNING: Skipping QR due to invalid Q")
 
-            # CRITICAL FIX: Final materialization before using Q in next domain
-            Q_final = torch.zeros_like(Q_curr)
-            Q_final.copy_(Q_curr)
-            Q_curr = Q_final.contiguous()
-
-            Lambda_final = torch.zeros_like(Lambda_curr)
-            Lambda_final.copy_(Lambda_curr)
-            Lambda_curr = Lambda_final.contiguous()
-
+            # Final materialization before using Q in next domain
+            Q_curr = Q_curr.detach().contiguous()
+            Lambda_curr = Lambda_curr.detach().contiguous()
             xm.mark_step()
 
             assert Q_curr is not None and Lambda_curr is not None, "Q/Lambda computation failed"

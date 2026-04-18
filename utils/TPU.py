@@ -31,7 +31,7 @@ def broadcast_Q_Lambda(
     """
     Broadcast Q and Lambda tensors from source rank (src) to all other ranks.
 
-    All ranks MUST call this function. Uses all_reduce for reliable broadcast.
+    All ranks MUST call this function. Uses all_gather for reliable broadcast.
     """
     if xr.world_size() <= 1:
         return Q, Lambda
@@ -40,6 +40,7 @@ def broadcast_Q_Lambda(
         return Q, Lambda
 
     rank = xr.global_ordinal()
+    world_size = xr.world_size()
 
     # Debug: Check input validity
     q_finite = torch.isfinite(Q).all().item()
@@ -47,43 +48,38 @@ def broadcast_Q_Lambda(
     if rank == 0:
         print(f"[broadcast_Q_Lambda] Input - Q finite: {q_finite}, Lambda finite: {l_finite}")
 
-    # CRITICAL FIX: Create fresh tensors with explicit copy to break any XLA graph dependencies
-    # This ensures the tensors are fully materialized before broadcast
-    Q_input = torch.zeros_like(Q)
-    Q_input.copy_(Q)
-
-    Lambda_input = torch.zeros_like(Lambda)
-    Lambda_input.copy_(Lambda)
-
-    # Sync to ensure copies complete
+    # CRITICAL FIX: Ensure Q and Lambda are fully materialized before broadcast
+    Q_input = Q.detach().clone().contiguous()
+    Lambda_input = Lambda.detach().clone().contiguous()
     xm.mark_step()
 
-    # Simple approach: src keeps its data, others contribute zeros
-    if rank == src:
-        Q_send = Q_input
-        Lambda_send = Lambda_input
-    else:
-        Q_send = torch.zeros_like(Q_input)
-        Lambda_send = torch.zeros_like(Lambda_input)
+    # METHOD: Use all_gather where we gather from all ranks, then select src's data
+    # This is more reliable than all_reduce for broadcast on XLA/TPU
 
-    # All-reduce sum - only src's data survives
-    Q_reduced = xm.all_reduce(xm.REDUCE_SUM, Q_send)
-    L_reduced = xm.all_reduce(xm.REDUCE_SUM, Lambda_send)
-
-    # CRITICAL: Force execution and create fresh output tensors
+    # Gather Q from all ranks - each rank contributes its Q_input
+    Q_gathered = xm.all_gather(Q_input, dim=0)  # shape: [world_size * n, k]
     xm.mark_step()
 
-    # Clone results to avoid any view/reference issues
-    Q_bcast = Q_reduced.detach().clone().contiguous()
-    L_bcast = L_reduced.detach().clone().contiguous()
+    # Reshape to [world_size, n, k] and select src rank
+    n, k = Q_input.shape
+    Q_gathered = Q_gathered.view(world_size, n, k)
+    Q_bcast = Q_gathered[src].clone().contiguous()
+    xm.mark_step()
 
-    # Another sync to ensure clones complete
+    # Gather Lambda from all ranks
+    Lambda_gathered = xm.all_gather(Lambda_input, dim=0)  # shape: [world_size * m]
+    xm.mark_step()
+
+    # Reshape and select src rank
+    m = Lambda_input.shape[0]
+    Lambda_gathered = Lambda_gathered.view(world_size, m)
+    L_bcast = Lambda_gathered[src].clone().contiguous()
     xm.mark_step()
 
     # Debug: Check output validity
     q_out_finite = torch.isfinite(Q_bcast).all().item()
     l_out_finite = torch.isfinite(L_bcast).all().item()
-    if rank == 0 or not q_out_finite:
-        print(f"[broadcast_Q_Lambda Rank {rank}] Output - Q finite: {q_out_finite}, max abs: {Q_bcast.abs().max().item() if q_out_finite else float('nan')}")
+    if not q_out_finite or not l_out_finite:
+        print(f"[broadcast_Q_Lambda Rank {rank}] Output - Q finite: {q_out_finite}, Lambda finite: {l_out_finite}")
 
     return Q_bcast, L_bcast
