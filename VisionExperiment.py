@@ -181,28 +181,46 @@ class NostalgiaExperiment:
         Q = F_local @ V
         Q = Q / singular_vals.unsqueeze(0)
 
+        # CRITICAL FIX: Sync before QR to ensure Q is fully computed
+        xm.mark_step()
+
         Q, _ = torch.linalg.qr(Q, mode="reduced")
         Lambda = eigvals
 
-        xm.mark_step()
-        if rank == 0:
-                qtq = Q.T @ Q
-                err = (
-                    qtq
-                    - torch.eye(
-                        qtq.shape[0],
-                        device=qtq.device,
-                        dtype=qtq.dtype,
-                    )
-                ).abs().max()
+        # CRITICAL FIX: Ensure Q/Lambda are valid and synced before returning
+        Q = Q.detach().clone().contiguous()
+        Lambda = Lambda.detach().clone().contiguous()
 
-                xm.master_print(
-                    f"[MASTER] FINAL RESULTS\n"
-                    f"Q shape: {Q.shape}\n"
-                    f"Lambda shape: {Lambda.shape}\n"
-                    f"Max eigenvalue: {Lambda.max().item():.6e}\n"
-                    f"Orthogonality error: {err.item():.6e}"
+        xm.mark_step()
+
+        # Validation: check for NaN/Inf
+        q_is_finite = torch.isfinite(Q).all().item()
+        l_is_finite = torch.isfinite(Lambda).all().item()
+
+        if rank == 0:
+            if not (q_is_finite and l_is_finite):
+                xm.master_print(f"[WARNING] Q or Lambda has non-finite values after single domain compute!")
+                xm.master_print(f"  Q finite: {q_is_finite}")
+                xm.master_print(f"  Lambda finite: {l_is_finite}")
+
+            qtq = Q.T @ Q
+            err = (
+                qtq
+                - torch.eye(
+                    qtq.shape[0],
+                    device=qtq.device,
+                    dtype=qtq.dtype,
                 )
+            ).abs().max()
+
+            xm.master_print(
+                f"[MASTER] FINAL RESULTS\n"
+                f"Q shape: {Q.shape}\n"
+                f"Lambda shape: {Lambda.shape}\n"
+                f"Max eigenvalue: {Lambda.max().item():.6e}\n"
+                f"Orthogonality error: {err.item():.6e}\n"
+                f"Q is finite: {q_is_finite}"
+            )
         return Q, Lambda
 
 
@@ -256,17 +274,42 @@ class NostalgiaExperiment:
                     k=k,
                 )
 
+            # CRITICAL FIX: Ensure Q_memory/Lambda_memory are valid after merge
+            Q_memory = Q_memory.detach().clone().contiguous()
+            Lambda_memory = Lambda_memory.detach().clone().contiguous()
+
             xm.mark_step()
 
+            # Validation: check for NaN/Inf
+            q_is_finite = torch.isfinite(Q_memory).all().item()
+            l_is_finite = torch.isfinite(Lambda_memory).all().item()
+
             if rank == 0:
+                if not (q_is_finite and l_is_finite):
+                    xm.master_print(f"[WARNING] Q_memory or Lambda_memory has non-finite values after merge!")
+                    xm.master_print(f"  Q finite: {q_is_finite}, Lambda finite: {l_is_finite}")
+
                 err = check_orthogonality(Q_memory)
 
                 xm.master_print(
                     f"[MASTER] After domain {domain}\n"
                     f"Q shape: {Q_memory.shape}\n"
                     f"Lambda shape: {Lambda_memory.shape}\n"
-                    f"Orthogonality error: {err}"
+                    f"Orthogonality error: {err}\n"
+                    f"Q is finite: {q_is_finite}"
                 )
+
+        # CRITICAL FIX: Final validation before returning
+        if Q_memory is not None and Lambda_memory is not None:
+            Q_memory = Q_memory.detach().clone().contiguous()
+            Lambda_memory = Lambda_memory.detach().clone().contiguous()
+            xm.mark_step()
+
+            # All-rank validation
+            q_is_finite = torch.isfinite(Q_memory).all().item()
+            l_is_finite = torch.isfinite(Lambda_memory).all().item()
+            if not (q_is_finite and l_is_finite):
+                xm.master_print(f"[Rank {rank}] ERROR: Q/Lambda has non-finite values BEFORE returning from update_Q_Lambda_for_all_past_domains!")
 
         return Q_memory, Lambda_memory
 
@@ -621,12 +664,33 @@ class NostalgiaExperiment:
             # ranks use the exact same subspace for the next domain.
             Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
 
+            # CRITICAL FIX: Ensure Q/Lambda are valid before broadcast
+            xm.mark_step()
+
+            # Validate Q before broadcast (only on rank 0 to avoid spam)
+            if rank == 0:
+                q_is_finite = torch.isfinite(Q_curr).all().item()
+                l_is_finite = torch.isfinite(Lambda_curr).all().item()
+                if not q_is_finite or not l_is_finite:
+                    xm.master_print(f"[ERROR] Q/Lambda has non-finite values BEFORE broadcast!")
+                    xm.master_print(f"  Q finite: {q_is_finite}, max abs: {Q_curr.abs().max().item()}")
+                    xm.master_print(f"  Lambda finite: {l_is_finite}, max: {Lambda_curr.max().item()}")
+
             # Broadcast from rank 0 → all ranks so every core has the same Q.
             Q_curr, Lambda_curr = broadcast_Q_Lambda(Q_curr, Lambda_curr, src=0)
+
+            # CRITICAL FIX: Sync after broadcast to ensure all ranks received the data
+            xm.mark_step()
+
+            # Validate Q after broadcast (all ranks should have the same value now)
+            q_is_finite = torch.isfinite(Q_curr).all().item()
+            if not q_is_finite:
+                xm.master_print(f"[Rank {rank}] ERROR: Q has non-finite values AFTER broadcast!")
 
             # Re-orthogonalise after broadcast (numerical safety).
             Q_curr, _ = torch.linalg.qr(Q_curr, mode="reduced")
 
+            # CRITICAL FIX: Final sync and validation before using Q in next domain
             Q_curr = Q_curr.detach().clone().contiguous()
             Lambda_curr = Lambda_curr.detach().clone().contiguous()
 
