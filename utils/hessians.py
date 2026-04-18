@@ -446,11 +446,20 @@ def recover_eigenspace_from_factor(
     Q = F_global @ V
     Q = Q / singular_vals.unsqueeze(0)
 
+    # CRITICAL: Sync before QR
+    xm.mark_step()
+
     # -------------------------------------
     # mandatory orthonormal cleanup
     # -------------------------------------
     Q, _ = torch.linalg.qr(Q, mode="reduced")
 
     Lambda = eigvals
+
+    # CRITICAL: Ensure Q and Lambda are fully materialized before returning
+    Q = Q.detach().clone().contiguous()
+    Lambda = Lambda.detach().clone().contiguous()
+
+    xm.mark_step()
 
     return Q, Lambda

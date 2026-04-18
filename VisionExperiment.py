@@ -188,8 +188,14 @@ class NostalgiaExperiment:
         Lambda = eigvals
 
         # CRITICAL FIX: Ensure Q/Lambda are valid and synced before returning
-        Q = Q.detach().clone().contiguous()
-        Lambda = Lambda.detach().clone().contiguous()
+        # Use explicit copy pattern for robust XLA materialization
+        Q_out = torch.zeros_like(Q)
+        Q_out.copy_(Q)
+        Q = Q_out.contiguous()
+
+        Lambda_out = torch.zeros_like(Lambda)
+        Lambda_out.copy_(Lambda)
+        Lambda = Lambda_out.contiguous()
 
         xm.mark_step()
 
@@ -275,8 +281,20 @@ class NostalgiaExperiment:
                 )
 
             # CRITICAL FIX: Ensure Q_memory/Lambda_memory are valid after merge
-            Q_memory = Q_memory.detach().clone().contiguous()
-            Lambda_memory = Lambda_memory.detach().clone().contiguous()
+            # Use explicit copy to avoid view issues
+            Q_temp = torch.zeros_like(Q_memory)
+            Q_temp.copy_(Q_memory)
+            Q_memory = Q_temp
+
+            Lambda_temp = torch.zeros_like(Lambda_memory)
+            Lambda_temp.copy_(Lambda_memory)
+            Lambda_memory = Lambda_temp
+
+            xm.mark_step()
+
+            # Make contiguous after copy
+            Q_memory = Q_memory.contiguous()
+            Lambda_memory = Lambda_memory.contiguous()
 
             xm.mark_step()
 
@@ -301,8 +319,15 @@ class NostalgiaExperiment:
 
         # CRITICAL FIX: Final validation before returning
         if Q_memory is not None and Lambda_memory is not None:
-            Q_memory = Q_memory.detach().clone().contiguous()
-            Lambda_memory = Lambda_memory.detach().clone().contiguous()
+            # Use explicit copy for robust materialization
+            Q_final = torch.zeros_like(Q_memory)
+            Q_final.copy_(Q_memory)
+            Q_memory = Q_final.contiguous()
+
+            Lambda_final = torch.zeros_like(Lambda_memory)
+            Lambda_final.copy_(Lambda_memory)
+            Lambda_memory = Lambda_final.contiguous()
+
             xm.mark_step()
 
             # All-rank validation
@@ -310,6 +335,8 @@ class NostalgiaExperiment:
             l_is_finite = torch.isfinite(Lambda_memory).all().item()
             if not (q_is_finite and l_is_finite):
                 xm.master_print(f"[Rank {rank}] ERROR: Q/Lambda has non-finite values BEFORE returning from update_Q_Lambda_for_all_past_domains!")
+            elif rank == 0:
+                xm.master_print(f"[Rank {rank}] Final Q valid, max abs: {Q_memory.abs().max().item():.6f}")
 
         return Q_memory, Lambda_memory
 
@@ -664,35 +691,64 @@ class NostalgiaExperiment:
             # ranks use the exact same subspace for the next domain.
             Q_curr, Lambda_curr = self.update_Q_Lambda_for_all_past_domains(domain_list, rank)
 
-            # CRITICAL FIX: Ensure Q/Lambda are valid before broadcast
+            # CRITICAL FIX: Force full materialization before broadcast
+            # Use explicit copy pattern for robust XLA materialization
+            Q_pre = torch.zeros_like(Q_curr)
+            Q_pre.copy_(Q_curr)
+            Q_curr = Q_pre.contiguous()
+
+            Lambda_pre = torch.zeros_like(Lambda_curr)
+            Lambda_pre.copy_(Lambda_curr)
+            Lambda_curr = Lambda_pre.contiguous()
+
             xm.mark_step()
 
             # Validate Q before broadcast (only on rank 0 to avoid spam)
             if rank == 0:
                 q_is_finite = torch.isfinite(Q_curr).all().item()
                 l_is_finite = torch.isfinite(Lambda_curr).all().item()
+                xm.master_print(f"[PRE-BROADCAST] Q valid: {q_is_finite}, max abs: {Q_curr.abs().max().item():.6f}")
+                xm.master_print(f"[PRE-BROADCAST] Lambda valid: {l_is_finite}, max: {Lambda_curr.max().item():.6f}")
                 if not q_is_finite or not l_is_finite:
                     xm.master_print(f"[ERROR] Q/Lambda has non-finite values BEFORE broadcast!")
-                    xm.master_print(f"  Q finite: {q_is_finite}, max abs: {Q_curr.abs().max().item()}")
-                    xm.master_print(f"  Lambda finite: {l_is_finite}, max: {Lambda_curr.max().item()}")
 
             # Broadcast from rank 0 → all ranks so every core has the same Q.
+            xm.master_print(f"[Rank {rank}] Starting broadcast...")
             Q_curr, Lambda_curr = broadcast_Q_Lambda(Q_curr, Lambda_curr, src=0)
 
-            # CRITICAL FIX: Sync after broadcast to ensure all ranks received the data
+            # CRITICAL FIX: Materialize after broadcast using explicit copy
+            Q_post = torch.zeros_like(Q_curr)
+            Q_post.copy_(Q_curr)
+            Q_curr = Q_post.contiguous()
+
+            Lambda_post = torch.zeros_like(Lambda_curr)
+            Lambda_post.copy_(Lambda_curr)
+            Lambda_curr = Lambda_post.contiguous()
+
             xm.mark_step()
 
-            # Validate Q after broadcast (all ranks should have the same value now)
+            # Validate Q after broadcast (all ranks)
             q_is_finite = torch.isfinite(Q_curr).all().item()
+            l_is_finite = torch.isfinite(Lambda_curr).all().item()
+            xm.master_print(f"[Rank {rank}] POST-BROADCAST: Q valid: {q_is_finite}, max abs: {Q_curr.abs().max().item() if q_is_finite else 'nan'}")
             if not q_is_finite:
                 xm.master_print(f"[Rank {rank}] ERROR: Q has non-finite values AFTER broadcast!")
 
             # Re-orthogonalise after broadcast (numerical safety).
-            Q_curr, _ = torch.linalg.qr(Q_curr, mode="reduced")
+            # Only proceed if Q is valid
+            if q_is_finite:
+                Q_curr, _ = torch.linalg.qr(Q_curr, mode="reduced")
+            else:
+                xm.master_print(f"[Rank {rank}] WARNING: Skipping QR due to invalid Q")
 
-            # CRITICAL FIX: Final sync and validation before using Q in next domain
-            Q_curr = Q_curr.detach().clone().contiguous()
-            Lambda_curr = Lambda_curr.detach().clone().contiguous()
+            # CRITICAL FIX: Final materialization before using Q in next domain
+            Q_final = torch.zeros_like(Q_curr)
+            Q_final.copy_(Q_curr)
+            Q_curr = Q_final.contiguous()
+
+            Lambda_final = torch.zeros_like(Lambda_curr)
+            Lambda_final.copy_(Lambda_curr)
+            Lambda_curr = Lambda_final.contiguous()
 
             xm.mark_step()
 
