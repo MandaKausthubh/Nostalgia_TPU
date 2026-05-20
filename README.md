@@ -4,24 +4,6 @@
 
 ---
 
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Key Ideas](#key-ideas)
-3. [Project Structure](#project-structure)
-4. [Requirements](#requirements)
-5. [Installation](#installation)
-6. [Dataset](#dataset)
-7. [Quick Start](#quick-start)
-8. [CLI Reference](#cli-reference)
-9. [Architecture](#architecture)
-10. [Algorithm Detail](#algorithm-detail)
-11. [TPU-Specific Notes](#tpu-specific-notes)
-12. [Logging & Monitoring](#logging--monitoring)
-13. [Experiment Modes](#experiment-modes)
-
----
-
 ## Overview
 
 **Nostalgia** is a continual learning framework for Vision Transformers (ViT) that prevents catastrophic forgetting by projecting gradients *out of* the high-curvature subspace of the Hessian accumulated over all previously seen tasks.
